@@ -2775,6 +2775,9 @@ void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     if (c->has_moe) {
         /* MoE forward pass */
         rmsnorm(s->xb, x, s->post_attn_norm_w[il], dim, eps);
+#ifdef PICOLM_GPU
+        tensor_set_gpu_tensor(NULL, 0);   /* else the router matmul runs on the last op's GPU weights */
+#endif
         moe_forward(m, s, s->xb, s->xb, lw);
         vec_add(x, s->xb, dim);
     } else if (lw->ffn_gate && lw->ffn_up && lw->ffn_down) {
@@ -5030,6 +5033,9 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
         for (bi = 0; bi < n_tokens; bi++) {
             rmsnorm(ssm_xb + bi * dim, x_batch + bi * dim, s->post_attn_norm_w[l], dim, eps);
         }
+#ifdef PICOLM_GPU
+        tensor_set_gpu_tensor(NULL, 0);   /* else the router matmul runs on the last op's GPU weights */
+#endif
         moe_forward_batch(m, s, ssm_xb, xb2_batch, n_tokens, lw);
         for (bi = 0; bi < n_tokens; bi++) {
             float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;

@@ -2262,7 +2262,12 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                             if (c->has_ssm) q_pipeline_dim = q_dim * 2;
                             else if (c->is_gpt2) q_pipeline_dim = q_dim * 3;
                             else q_pipeline_dim = q_dim;
-                            if (!picolm_gpu_pipeline_alloc(c->n_embd, q_pipeline_dim, kv_dim, c->n_ffn, c->vocab_size, device)) {
+                            /* Decode on SSM models also puts the attention output gate
+                             * (n_heads * head_dim) into pipe_gate; a MoE n_ffn (the
+                             * expert width) is smaller than that. */
+                            int dec_gu = c->n_ffn;
+                            if (c->has_ssm && dec_gu < q_pipeline_dim) dec_gu = q_pipeline_dim;
+                            if (!picolm_gpu_pipeline_alloc(c->n_embd, q_pipeline_dim, kv_dim, dec_gu, c->vocab_size, device)) {
                                 fprintf(stderr, "WARN: GPU pipeline buffer alloc failed\n");
                             }
                             /* Prefill batch buffers - xb_stride must accommodate both
