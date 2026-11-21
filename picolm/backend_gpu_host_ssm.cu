@@ -1055,7 +1055,7 @@ picolm_gpu_ssm_vecdot_dev(float *out_dev,
                            const int *head_map_dev,
                            int device) {
     if (n_v_heads <= 0 || dim <= 0) return 0;
-    if (qtype != 0 && qtype != 2 && qtype != 8 && qtype != 14 && qtype != 30 && qtype != 41) return 0;
+    if (qtype != 0 && qtype != 2 && qtype != 8 && qtype != 12 && qtype != 14 && qtype != 30 && qtype != 41) return 0;
     if (dim > PICOLM_SSM_VECDOT_MAX_DIM) return 0;
 
     gpu_device_ctx_t *ctx = find_ctx(device);
@@ -1070,7 +1070,7 @@ picolm_gpu_ssm_vecdot_dev(float *out_dev,
     if (vecdot_serial < 0)
         vecdot_serial = getenv("PICOLM_SSM_VECDOT_SERIAL") ? 1 : 0;
 #ifndef PICOLM_NO_WARP_VECDOT
-    if (!vecdot_serial) {
+    if (!vecdot_serial && qtype != 12) {   /* Q4_K: serial kernel only */
         dim3 wgrid((unsigned)((n_v_heads + VEC_WARP_HEADS - 1) / VEC_WARP_HEADS), 1, 1);
         picolm_ssm_vecdot_warp_kernel<<<wgrid, 32 * VEC_WARP_HEADS, 0, ctx->stream>>>(
             out_dev, x_dev, weights_dev, qtype, dim, n_v_heads, row_bytes, head_map_dev);

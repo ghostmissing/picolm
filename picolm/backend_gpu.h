@@ -705,6 +705,8 @@ float *picolm_gpu_upload_f32(const float *host, size_t n, int device);
 /* Synchronous memcpy wrapper for model.c (which is C, not CUDA).
  * dir: 1 = H2D, -1 = D2H, 0 = D2D. Returns 1 on success. */
 int picolm_gpu_memcpy(void *dst, const void *src, size_t bytes, int dir, int device);
+int picolm_gpu_memcpy_2d(void *dst, size_t dpitch, const void *src, size_t spitch,
+                         size_t width, size_t rows, int dir, int device);
 /* Async variant: no device sync, caller manages stream ordering. */
 int picolm_gpu_memcpy_async(void *dst, const void *src, size_t bytes, int dir, int device);
 /* Pinned host staging buffer for async H2D. Auto-grows. */

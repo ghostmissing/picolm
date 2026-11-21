@@ -2170,6 +2170,25 @@ picolm_gpu_sync(int device) {
  * dir: 1 = H2D, -1 = D2H, 0 = D2D. Returns 1 on success.
  * Uses ctx->stream for the actual transfer to avoid multi-engine
  * reordering with default stream on sm_121 (GB10/CUDA 13). */
+/* Strided form of picolm_gpu_memcpy: `rows` rows of `width` bytes, `dpitch` /
+ * `spitch` bytes apart. Same dir convention and the same ordering: D2H waits
+ * for the stream first, H2D/D2D are queued on it. */
+extern "C" int
+picolm_gpu_memcpy_2d(void *dst, size_t dpitch, const void *src, size_t spitch,
+                     size_t width, size_t rows, int dir, int device) {
+    if (!dst || !src || width < 1 || rows < 1) return 0;
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    gpuMemcpyKind kind = (dir > 0) ? gpuMemcpyHostToDevice :
+                          (dir < 0) ? gpuMemcpyDeviceToHost :
+                                      gpuMemcpyDeviceToDevice;
+    if (dir < 0) {
+        if (!gpu_ok(gpuStreamSynchronize(ctx->stream), "memcpy_2d D2H stream sync")) return 0;
+        return gpu_ok(gpuMemcpy2D(dst, dpitch, src, spitch, width, rows, kind), "memcpy_2d D2H");
+    }
+    return gpu_ok(gpuMemcpy2DAsync(dst, dpitch, src, spitch, width, rows, kind, ctx->stream), "memcpy_2d async");
+}
+
 extern "C" int
 picolm_gpu_memcpy(void *dst, const void *src, size_t bytes, int dir, int device) {
     if (!dst || !src || bytes < 1) return 0;

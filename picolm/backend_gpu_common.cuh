@@ -65,6 +65,7 @@
 #define gpuFree hipFree
 #define gpuMemcpy hipMemcpy
 #define gpuMemcpy2D hipMemcpy2D
+#define gpuMemcpy2DAsync hipMemcpy2DAsync
 #define gpuMemcpyKind hipMemcpyKind
 #define gpuMemcpyHostToDevice hipMemcpyHostToDevice
 #define gpuMemcpyDeviceToHost hipMemcpyDeviceToHost
@@ -158,6 +159,7 @@ typedef hipEvent_t gpuEvent_t;
 #define gpuFree cudaFree
 #define gpuMemcpy cudaMemcpy
 #define gpuMemcpy2D cudaMemcpy2D
+#define gpuMemcpy2DAsync cudaMemcpy2DAsync
 #define gpuMemcpyKind cudaMemcpyKind
 #define gpuMemcpyHostToDevice cudaMemcpyHostToDevice
 #define gpuMemcpyDeviceToHost cudaMemcpyDeviceToHost

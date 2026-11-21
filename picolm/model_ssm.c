@@ -2822,6 +2822,38 @@ ssm_ffn_done:
  * fall back to D2H + ssm_forward + H2D).
  */
 #ifdef PICOLM_GPU
+/* MoE FFN inside the GPU pipelines, whose FFN blocks are dense-only. Copies
+ * the n normed rows (stride floats apart; 0 = dim) to the host, runs
+ * moe_forward / moe_forward_batch there -- router, shared expert and the
+ * routed experts, read from host RAM -- and copies the result to out_dev at
+ * the same stride. One sync and two strided copies per call. The routed
+ * experts are never uploaded, so this also runs a MoE larger than VRAM. */
+static int gpu_pipeline_moe_ffn(model_t *m, const layer_weights_t *lw,
+                                float *out_dev, const float *in_dev,
+                                int n, int stride, int dev) {
+    static float *buf;
+    static size_t cap;
+    int dim = m->config.n_embd;
+    if (stride <= 0) stride = dim;
+    size_t need = (size_t)2 * n * dim;
+    if (need > cap) {
+        float *nb = (float *)realloc(buf, need * sizeof(float));
+        if (!nb) return 0;
+        buf = nb; cap = need;
+    }
+    float *h_in = buf, *h_out = buf + (size_t)n * dim;
+    size_t row = (size_t)dim * sizeof(float), pitch = (size_t)stride * sizeof(float);
+    if (!picolm_gpu_memcpy_2d(h_in, row, in_dev, pitch, row, (size_t)n, -1, dev)) return 0;
+    tensor_set_gpu_tensor(NULL, 0);
+    /* moe_forward_batch keeps at most 256 tokens per expert (mm_id). */
+    for (int i = 0; i < n; i += 256) {
+        int k = n - i < 256 ? n - i : 256;
+        if (k == 1) moe_forward(m, &m->state, h_in + (size_t)i * dim, h_out + (size_t)i * dim, lw);
+        else moe_forward_batch(m, &m->state, h_in + (size_t)i * dim, h_out + (size_t)i * dim, k, lw);
+    }
+    return picolm_gpu_memcpy_2d(out_dev, pitch, h_out, row, row, (size_t)n, 1, dev);
+}
+
 static int
 ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
                 layer_weights_t *lw, int il, int pos, void *gpu_lw, int device) {
@@ -2840,27 +2872,13 @@ ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
     int repeat = n_v_heads / n_k_heads;
     float eps = c->rms_norm_eps;
 
-    /* Bug 3 fix: this GPU-native path has no MoE FFN implementation --
-     * step 16 below only wires up dense ffn_gate/up/down. On a MoE layer
-     * gl->ffn_gate would be NULL and the block would silently no-op,
-     * dropping the FFN entirely. Bail before any state mutation. */
-    if (c->has_moe) return 0;
-
     /* Prerequisites: all GPU tensors must be resident */
     if (!gl->attn_qkv || !gl->attn_gate_ssm || !gl->ssm_out || !gl->ssm_conv1d) return 0;
     if (!gw->ssm_alpha_dev[il] || !gw->ssm_beta_dev[il] || !gw->ssm_a_dev[il]) return 0;
     if (!gw->ssm_dt_dev[il] || !gw->ssm_norm_dev[il]) return 0;
     if (!gw->ssm_conv_state_dev[il] || !gw->ssm_state_dev[il]) return 0;
 
-    /* Bug 3 fix (2026-08-11): this GPU-native path has no MoE FFN
-     * implementation -- step 16 below only wires up dense ffn_gate/up/
-     * down. On a MoE layer gl->ffn_gate would be NULL and that whole
-     * block would silently no-op, dropping the FFN's contribution
-     * entirely (not a numerical difference -- a missing computation).
-     * Bail here, before anything below has mutated persistent state, so
-     * the caller's CPU-hybrid ssm_forward() fallback (which does call
-     * moe_forward()) is always safe to take. */
-    if (c->has_moe) return 0;
+    /* MoE layers: the caller's FFN block runs the MoE (gpu_pipeline_moe_ffn). */
 
     /* Pipeline buffers */
     float *pipe_x = picolm_gpu_pipe_x(device);
@@ -3270,8 +3288,8 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     /* Alpha/beta vecdot (read from RMSNorm'd bffn_norm) */
     if(ok){gguf_type_t at=lw->type_ssm_alpha,bt=lw->type_ssm_beta;
       size_t ra=gguf_type_row_size(at,dim),rb=gguf_type_row_size(bt,dim);
-      if(at!=0&&at!=2&&at!=8&&at!=14&&at!=30&&at!=41){static int w1=0;if(!w1){fprintf(stderr,"WARN: ssm_prefill_layer_gpu bail: alpha type=%d (need F32/Q4_0/Q8_0/Q6_K/BF16/Q1_0)\n",(int)at);w1=1;}return 0;}
-      if(bt!=0&&bt!=2&&bt!=8&&bt!=14&&bt!=30&&bt!=41){static int w2=0;if(!w2){fprintf(stderr,"WARN: ssm_prefill_layer_gpu bail: beta type=%d (need F32/Q4_0/Q8_0/Q6_K/BF16/Q1_0)\n",(int)bt);w2=1;}return 0;}
+      if(at!=0&&at!=2&&at!=8&&at!=12&&at!=14&&at!=30&&at!=41){static int w1=0;if(!w1){fprintf(stderr,"WARN: ssm_prefill_layer_gpu bail: alpha type=%d (need F32/Q4_0/Q8_0/Q4_K/Q6_K/BF16/Q1_0)\n",(int)at);w1=1;}return 0;}
+      if(bt!=0&&bt!=2&&bt!=8&&bt!=12&&bt!=14&&bt!=30&&bt!=41){static int w2=0;if(!w2){fprintf(stderr,"WARN: ssm_prefill_layer_gpu bail: beta type=%d (need F32/Q4_0/Q8_0/Q4_K/Q6_K/BF16/Q1_0)\n",(int)bt);w2=1;}return 0;}
       if(!gl->ssm_alpha||!gl->ssm_beta){static int w3=0;if(!w3){fprintf(stderr,"WARN: ssm_prefill_layer_gpu bail: alpha/beta not uploaded to GPU\n");w3=1;}return 0;}
       const int *hm=do_remap&&gw->ssm_head_map_dev?(const int*)gw->ssm_head_map_dev:NULL;
       ok&=picolm_gpu_ssm_vecdot_batch_dev(bgate,bffn_norm,(void*)picolm_gpu_tensor_weights((picolm_gpu_tensor_t*)gl->ssm_alpha),at,dim,n_v,n_tokens,(int)ra,hm,dev,xb2_stride,xb2_stride);
@@ -3661,6 +3679,11 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
       }
       ok&=picolm_gpu_residual_add(bx,bx,battn_out,n_tokens,dim,xb2_stride,dev);
 
+    }
+    else if(ok&&c->has_moe&&lw->ffn_gate_exps){
+      ok&=picolm_gpu_rmsnorm_batched_dev(bffn_norm,bx,(float*)gw->post_attn_norm_dev[l],dim,eps,n_tokens,xb2_stride,dev);
+      ok&=gpu_pipeline_moe_ffn(m,lw,battn_out,bffn_norm,n_tokens,xb2_stride,dev);
+      ok&=picolm_gpu_residual_add(bx,bx,battn_out,n_tokens,dim,xb2_stride,dev);
     }
     SSM_DBG_SYNC;
     if (l == 0 && ok && _SSM_DBG) {
@@ -5677,7 +5700,13 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                         l, dmp[0],dmp[1],dmp[2],dmp[3],dmp[4],dmp[5],dmp[6],dmp[7]);
             }
 
-            if (gl->ffn_gate) {
+            int moe_l = c->has_moe && lw->ffn_gate_exps;
+            if (moe_l) {
+                if (!gpu_pipeline_moe_ffn(m, lw, pipe_xb, pipe_ffn_norm, 1, 0, gpu_dev)) {
+                    fprintf(stderr, "FATAL: MoE FFN failed for layer %d, pos %d.\n", l, pos);
+                    abort();
+                }
+            } else if (gl->ffn_gate) {
                 /* L. Gate: pipe_gate = ffn_gate @ pipe_ffn_norm */
                 picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_gate,
                                        pipe_gate, pipe_ffn_norm, 1, gpu_dev, 0, 0);
@@ -5713,7 +5742,7 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
             }
 
             /* O. Down: pipe_xb = ffn_down @ pipe_gate */
-            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_down,
+            if (!moe_l) picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_down,
                                    pipe_xb, pipe_gate, 1, gpu_dev, q_pipeline_dim, 0);
             /* GPT-2 FFN down bias (decode) */
             if (gw->ffn_down_bias_dev[l]) {
@@ -6417,6 +6446,10 @@ after_qkv:
                                             dim, c->rms_norm_eps, n_ubatch, xb_stride, gpu_dev);
         }
 
+        int moe_l = c->has_moe && lw->ffn_gate_exps;
+        if (moe_l) {
+            if (!gpu_pipeline_moe_ffn(m, lw, bxb, bffn_norm, n_ubatch, xb_stride, gpu_dev)) return -1;
+        } else
         /* FFN gate+up: SwiGLU (gate+up) vs GELU (up only, no separate gate) */
         if (gl->ffn_gate) {
             /* SwiGLU: gate = ffn_gate @ norm, up = ffn_up @ norm */
@@ -6454,6 +6487,7 @@ after_qkv:
         }
 
         /* FFN down */
+        if (!moe_l)
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_down,
                                bxb, bgate, n_ubatch, gpu_dev, xb_stride, attn_ffn_stride);
         /* GPT-2 FFN down bias */
