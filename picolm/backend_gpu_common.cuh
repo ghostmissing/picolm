@@ -84,6 +84,7 @@ static inline hipError_t picolm_hipMemcpy2D(void *dst, size_t dpitch,
     return hipMemcpy2D(dst, dpitch, src, spitch, width, height, kind);
 }
 #define gpuMemcpy2D picolm_hipMemcpy2D
+#define gpuMemcpy2DAsync hipMemcpy2DAsync
 #define gpuMemcpyKind hipMemcpyKind
 #define gpuMemcpyHostToDevice hipMemcpyHostToDevice
 #define gpuMemcpyDeviceToHost hipMemcpyDeviceToHost
@@ -187,6 +188,7 @@ static inline cudaError_t picolm_cudaMemcpy2D(void *dst, size_t dpitch,
     return cudaMemcpy2D(dst, dpitch, src, spitch, width, height, kind);
 }
 #define gpuMemcpy2D picolm_cudaMemcpy2D
+#define gpuMemcpy2DAsync cudaMemcpy2DAsync
 #define gpuMemcpyKind cudaMemcpyKind
 #define gpuMemcpyHostToDevice cudaMemcpyHostToDevice
 #define gpuMemcpyDeviceToHost cudaMemcpyDeviceToHost

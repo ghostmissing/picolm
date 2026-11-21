@@ -2281,8 +2281,14 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                             if (c->n_embd > xb_stride) xb_stride = c->n_embd;
                             int gpu_max_ubatch = picolm_prefill_ubatch();
                             if (gpu_max_ubatch > c->max_seq_len) gpu_max_ubatch = c->max_seq_len;
+                            /* The SSM prefill also writes alpha/beta into the gate/up
+                             * buffers at xb_stride per token. For a MoE, n_ffn is the
+                             * small expert width (512 on Qwen3.6-35B-A3B) and those
+                             * writes ran past the end of the buffers. */
+                            int gu_dim = c->n_ffn;
+                            if (c->has_ssm && gu_dim < xb_stride) gu_dim = xb_stride;
                             if (!picolm_gpu_pipeline_batch_alloc(c->n_embd, q_pipeline_dim, kv_dim,
-                                                                 c->n_ffn, xb_stride, gpu_max_ubatch, device)) {
+                                                                 gu_dim, xb_stride, gpu_max_ubatch, device)) {
                                 fprintf(stderr, "WARN: GPU prefill batch buffer alloc failed\n");
                             }
 
@@ -4054,6 +4060,9 @@ float *model_forward_range(model_t *m, int token, int pos, int l_lo, int l_hi,
         if (c->has_moe && lw->ffn_gate_exps) {
             /* MoE forward pass */
             rmsnorm(s->xb, s->x, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
+#ifdef PICOLM_GPU
+            tensor_set_gpu_tensor(NULL, 0);   /* else the router matmul runs on attn_output's GPU copy */
+#endif
             moe_forward(m, s, s->xb, s->xb, lw);
             vec_add(s->x, s->xb, dim);
         } else if (lw->ffn_gate && lw->ffn_up && lw->ffn_down) {
@@ -6433,6 +6442,9 @@ float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, 
             for (bi = 0; bi < n_tokens; bi++) {
                 rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
             }
+#ifdef PICOLM_GPU
+            tensor_set_gpu_tensor(NULL, 0);   /* else the router matmul runs on attn_output's GPU copy */
+#endif
             moe_forward_batch(m, s, xb_batch, xb2_batch, n_tokens, lw);
             for (bi = 0; bi < n_tokens; bi++) {
                 float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;

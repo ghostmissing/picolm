@@ -6771,6 +6771,11 @@ picolm_ssm_vecdot_kernel(float *out,
         for (int i = 0; i < dim; i++) sum += wrow_f[i] * x[i];
         break;
     }
+    case 12: { /* Q4_K: 144-byte super-blocks of 256 */
+        for (int i = 0; i < dim; i++)
+            sum += dequant_q4_K(wrow + (size_t)(i / 256) * 144, i % 256) * x[i];
+        break;
+    }
     case 2: { /* Q4_0 weight x Q8_0(x) -- matches vec_dot_q4_0_q8_0 scalar tail */
         int n_blocks = dim / 32;
         for (int bi = 0; bi < n_blocks; bi++) {
@@ -6957,6 +6962,11 @@ picolm_ssm_vecdot_batch_kernel(float *out,
             for (int j = 0; j < 32; j++) sumi += (int)yq[j] * (int)qs[j];
             sum += (float)sumi * xq_d[bi] * wd;
         }
+        break;
+    }
+    case 12: { /* Q4_K: 144-byte super-blocks of 256 */
+        for (int i = 0; i < dim; i++)
+            sum += dequant_q4_K(wrow + (size_t)(i / 256) * 144, i % 256) * xt[i];
         break;
     }
     case 30: {
