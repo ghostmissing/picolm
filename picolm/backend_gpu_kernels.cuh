@@ -150,7 +150,7 @@ __global__ void picolm_q8_q8_matmul_hmma(float *y, const int8_t *xq, const float
 __global__ void picolm_iq6_k_q8_K_matmul_hmma(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
 /* Q4_K/Q5_K/Q6_K (qtype 12/13/14) x Q8_K GEMM on Volta tensor cores (prefill); xbs = Q8_K bsums.
  * grid ((O+63)/64, (S+127)/128), 128 threads. */
-__global__ void picolm_kq_q8_K_matmul_hmma(float *y, const int8_t *xq, const float *xd, const int16_t *xbs, const void *weights, int qtype, int S, int I, int O, int row_bytes, int y_stride);
+int picolm_kq_q8_K_matmul_hmma_launch(int qtype, dim3 grid, gpuStream_t stream, float *y, const int8_t *xq, const float *xd, const int16_t *xbs, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
 
 __global__ void picolm_q8_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
                                           const void *weights, int S, int I, int O,

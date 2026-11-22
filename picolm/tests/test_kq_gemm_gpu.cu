@@ -45,9 +45,9 @@ static int run(int qt, int S, int I, int O) {
     cudaMalloc(&dw, (size_t)O * rb); cudaMalloc(&dq, (size_t)S * I); cudaMalloc(&dd, (size_t)S * ns * 4); cudaMalloc(&db, (size_t)S * ns * 32); cudaMalloc(&dy, (size_t)S * O * 4);
     cudaMemcpy(dw, w, (size_t)O * rb, cudaMemcpyHostToDevice); cudaMemcpy(dq, xq, (size_t)S * I, cudaMemcpyHostToDevice); cudaMemcpy(dd, xd, (size_t)S * ns * 4, cudaMemcpyHostToDevice); cudaMemcpy(db, bs, (size_t)S * ns * 32, cudaMemcpyHostToDevice);
     dim3 g((O + 63) / 64, (S + 127) / 128);
-    picolm_kq_q8_K_matmul_hmma<<<g, 128>>>(dy, dq, dd, db, dw, qt, S, I, O, rb, O);
+    picolm_kq_q8_K_matmul_hmma_launch(qt, g, 0, dy, dq, dd, db, dw, S, I, O, rb, O);
     cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b); cudaEventRecord(a);
-    for (int r = 0; r < 3; r++) picolm_kq_q8_K_matmul_hmma<<<g, 128>>>(dy, dq, dd, db, dw, qt, S, I, O, rb, O);
+    for (int r = 0; r < 3; r++) picolm_kq_q8_K_matmul_hmma_launch(qt, g, 0, dy, dq, dd, db, dw, S, I, O, rb, O);
     cudaEventRecord(b); cudaEventSynchronize(b); float ms; cudaEventElapsedTime(&ms, a, b); ms /= 3;
     float *hy = (float *)malloc((size_t)S * O * 4); cudaMemcpy(hy, dy, (size_t)S * O * 4, cudaMemcpyDeviceToHost);
     cudaError_t err = cudaGetLastError();

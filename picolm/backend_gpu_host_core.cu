@@ -1600,8 +1600,8 @@ kquant_hmma_dev(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t *t, float *y_dev,
             y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
     } else {
         gpu_dispatch_print("matmul_kq_hmma_dev");
-        picolm_kq_q8_K_matmul_hmma<<<grid, 128, 0, ctx->stream>>>(
-            y_dev, ctx->q8_xq, ctx->q8_xd, ctx->q8_k_bsums, t->weights, (int)t->qtype,
+        picolm_kq_q8_K_matmul_hmma_launch((int)t->qtype, grid, ctx->stream,
+            y_dev, ctx->q8_xq, ctx->q8_xd, ctx->q8_k_bsums, t->weights,
             S, I, O, (int)t->row_bytes, ys);
     }
     return gpu_ok(gpuGetLastError(), "k-quant matmul hmma (dev)");
