@@ -90,7 +90,7 @@ static int kquant_which(gguf_type_t qt) {
     }
 }
 static int kquant_gemv_dev(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t *t, float *y_dev,
-                           const float *x_dev, int I, int O, int ys, int x_stride, int which);
+                           const float *x_dev, int I, int O, int ys, int x_stride, int which, int quantize);
 static int picolm_gpu_no_sm_imma(void) {
     static int cached = -1;
     if (cached < 0) cached = picolm_gpu_env_flag("PICOLM_NO_SM_IMMA");
@@ -1295,7 +1295,7 @@ static int matmul_host_impl(picolm_gpu_tensor_t *t, float *y, const float *x, in
      * on the per-element dequant matmul. IMMA GPUs keep their IMMA path here. */
     if (!ctx->has_imma && S == 1 && O >= 8 && I % 256 == 0 && kquant_which(t->qtype) && !picolm_gpu_no_gemv()) {
         if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
-        if (kquant_gemv_dev(ctx, t, ctx->y, ctx->x, I, O, O, 0, kquant_which(t->qtype))) {
+        if (kquant_gemv_dev(ctx, t, ctx->y, ctx->x, I, O, O, 0, kquant_which(t->qtype), 1)) {
             if (!gpu_ok(gpuStreamSynchronize(ctx->stream), "kquant gemv sync") ||
                 !gpu_ok(gpuMemcpy(y, ctx->y, yb, gpuMemcpyDeviceToHost), "output download")) return 0;
             return 1;
@@ -1574,7 +1574,7 @@ picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, int d
 static int
 kquant_gemv_dev(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t *t, float *y_dev,
                 const float *x_dev, int I, int O, int ys, int x_stride,
-                int which /* 5 or 6 */) {
+                int which /* 5 or 6 */, int quantize /* 0: reuse ctx's Q8_K x */) {
     const int n_super = I / 256;
     if (n_super < 1 || I % 256 != 0) return 0;
     if (x_stride > 0 && x_stride != I) return 0;   /* GEMV assumes packed x */
@@ -1606,13 +1606,14 @@ kquant_gemv_dev(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t *t, float *y_dev,
      * this stream and, at one launch per matmul call, it is part of the cost
      * being attributed. This used to pass device 0 unconditionally as well,
      * which times the wrong context on a multi-device setup. */
-    { int _psq = picolm_gpu_prof_slot("quantize_q8");
+    if (quantize) {
+      int _psq = picolm_gpu_prof_slot("quantize_q8");
       picolm_gpu_prof_begin(ctx->device);
       picolm_quantize_q8_K<<<q_grid, 256, 0, ctx->stream>>>(
           ctx->q8_xd, ctx->q8_xq, ctx->q8_k_bsums, x_dev, I, 1);
       picolm_gpu_prof_end(_psq);
+      if (!gpu_ok(gpuGetLastError(), "q8_K quantize (dev)")) return 0;
     }
-    if (!gpu_ok(gpuGetLastError(), "q8_K quantize (dev)")) return 0;
     picolm_gpu_prof_begin(ctx->device);
     if (which == 141) {
         gpu_dispatch_print("matmul_iq6_gemv_dev");
@@ -1636,6 +1637,22 @@ kquant_gemv_dev(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t *t, float *y_dev,
     }
     picolm_gpu_prof_end(_ps);
     return gpu_ok(gpuGetLastError(), "kquant gemv (dev)");
+}
+
+/* n K-quant GEMVs (decode, S=1) on the same input: Q8_K-quantise x once.
+ * The separate picolm_gpu_matmul_dev calls quantised it once each -- on
+ * Moistral-11B Q4_K_M that was 7 launches per layer and ~10% of a token. */
+static int
+kquant_gemv_shared(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t **t, float **y, int n,
+                   const float *x_dev, int x_stride) {
+    const int I = t[0]->I;
+    if (picolm_gpu_no_gemv() || I % 256 != 0 || (x_stride > 0 && x_stride != I)) return 0;
+    for (int i = 0; i < n; i++)
+        if (!t[i] || !y[i] || t[i]->I != I || t[i]->O < 8 || !kquant_which(t[i]->qtype)) return 0;
+    for (int i = 0; i < n; i++)
+        if (!kquant_gemv_dev(ctx, t[i], y[i], x_dev, I, t[i]->O, t[i]->O, x_stride,
+                             kquant_which(t[i]->qtype), i == 0)) return 0;
+    return 1;
 }
 
 /* PICOLM_LAUNCH_TMR=1: accumulate the CPU wall time spent inside
@@ -1877,18 +1894,18 @@ matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
          * per-element dequant. (An earlier version returned 0 here, which
          * looked safe but silently disabled IQ6_K for ALL of prefill: the
          * dequant case could never be reached.) */
-        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 141))
+        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 141, 1))
             return 1;
     }
 
     /* K-quant decode on the GEMVs on any GPU; the has_imma branches below
      * used to be the only way in (see the host path). */
     if (S == 1 && O >= 8 && I % 256 == 0 && kquant_which(t->qtype) && !picolm_gpu_no_gemv() &&
-        kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, kquant_which(t->qtype)))
+        kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, kquant_which(t->qtype), 1))
         return 1;
 
     if (t->qtype == GGUF_TYPE_Q2_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
-        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 2))
+        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 2, 1))
             return 1;
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
@@ -1918,7 +1935,7 @@ matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
 
     /* Q3_K x Q8_0 IMMA path (device) */
     if (t->qtype == GGUF_TYPE_Q3_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
-        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 3))
+        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 3, 1))
             return 1;
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
@@ -1950,7 +1967,7 @@ matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
      * Uses picolm_q6_q8_matmul_imma (m16n8k32 tensor cores, 2 IMMA per K-step). */
     if (t->qtype == GGUF_TYPE_Q6_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
         /* Decode fast path: Q6_K GEMV against Q8_K activations. */
-        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 6))
+        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 6, 1))
             return 1;
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
@@ -1999,7 +2016,7 @@ matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     if (t->qtype == GGUF_TYPE_Q5_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
         /* Decode fast path: Q5_K GEMV against Q8_K activations, matching the
          * CPU's activation format for K-quant weights. */
-        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 5))
+        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 5, 1))
             return 1;
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
@@ -2092,7 +2109,7 @@ matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
 
     /* Q4_K x Q8_0 IMMA path (device) -- ENABLED */
     if (t->qtype == GGUF_TYPE_Q4_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
-        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 4))
+        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 4, 1))
             return 1;
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
@@ -2353,7 +2370,7 @@ int picolm_gpu_matmul_logits(picolm_gpu_tensor_t *t, float *logits_dev,
      * and therefore ZEROES the logits, poisoning every later token. Reusing
      * kquant_gemv_dev (Q8_K quantise + IQ6_K GEMV) avoids that entirely. */
     if (kquant_which(t->qtype) && (I % 256) == 0 && O >= 8) {   /* and the other K-quants */
-        if (kquant_gemv_dev(ctx, t, logits_dev, x_dev, I, O, O, 0, kquant_which(t->qtype))) return 1;
+        if (kquant_gemv_dev(ctx, t, logits_dev, x_dev, I, O, O, 0, kquant_which(t->qtype), 1)) return 1;
         return 0;
     }
     return 0; /* unsupported type */
@@ -2443,9 +2460,16 @@ int picolm_gpu_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk, 
     if (!tq || !tk || !tv || !bq || !bk || !bv || !x_dev || S < 1) return 0;
     if (tq->I < 512 || tk->I < 512 || tv->I < 512) return 0;
     if (tq->I != tk->I || tq->I != tv->I) return 0;
+    if (picolm_gpu_force_f32()) return 0;
+    if (S == 1) {   /* decode: K-quant GEMVs on one Q8_K quantize; else the separate calls */
+        gpu_device_ctx_t *ctx = find_ctx(device);
+        if (!select_ctx(ctx)) return 0;
+        picolm_gpu_tensor_t *t[3] = { tq, tk, tv };
+        float *y[3] = { bq, bk, bv };
+        return kquant_gemv_shared(ctx, t, y, 3, x_dev, x_stride);
+    }
     if (tq->qtype != GGUF_TYPE_Q8_0 || tk->qtype != GGUF_TYPE_Q8_0 || tv->qtype != GGUF_TYPE_Q8_0)
         return 0;
-    if (picolm_gpu_force_f32()) return 0;
 
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!select_ctx(ctx)) return 0;
@@ -2604,8 +2628,15 @@ int picolm_gpu_matmul_dev_gu(picolm_gpu_tensor_t *tg, picolm_gpu_tensor_t *tu,
     if (!tg || !tu || !bgate || !bup || !x_dev || S < 1) return 0;
     if (tg->I < 512 || tu->I < 512) return 0;
     if (tg->I != tu->I) return 0;
-    if (tg->qtype != GGUF_TYPE_Q8_0 || tu->qtype != GGUF_TYPE_Q8_0) return 0;
     if (picolm_gpu_force_f32()) return 0;
+    if (S == 1) {   /* decode: K-quant GEMVs on one Q8_K quantize; else the separate calls */
+        gpu_device_ctx_t *ctx = find_ctx(device);
+        if (!select_ctx(ctx)) return 0;
+        picolm_gpu_tensor_t *t[2] = { tg, tu };
+        float *y[2] = { bgate, bup };
+        return kquant_gemv_shared(ctx, t, y, 2, x_dev, x_stride);
+    }
+    if (tg->qtype != GGUF_TYPE_Q8_0 || tu->qtype != GGUF_TYPE_Q8_0) return 0;
 
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!select_ctx(ctx)) return 0;

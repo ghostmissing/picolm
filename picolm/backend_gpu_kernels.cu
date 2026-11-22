@@ -612,8 +612,8 @@ picolm_q8_q8_matmul(float *y,
  * inf/NaN can appear downstream.
  *
  * Layout per block: 292 bytes = float d + int8 qs[256] + int16 bsums[16].
- * One CUDA block per super-block; 256 threads, one value each, absmax via a
- * shared-memory tree reduce. Output buffers therefore need
+ * One CUDA block per super-block; 256 threads, one value each, absmax and
+ * bsums via warp shuffles. Output buffers therefore need
  * (I/256)*292 bytes per row, not (I/32)*34.
  */
 /* GPU_BLOCK_Q8_K_SIZE is defined in backend_gpu_kernels.cuh. */
@@ -629,17 +629,19 @@ picolm_quantize_q8_K(float *d_out, int8_t *qs_out, int16_t *bsums_out,
     const float *xb = x + (size_t)s * I + (size_t)sb * 256;
     float v = xb[tid];
 
-    __shared__ float amax_sh[256];
-    amax_sh[tid] = fabsf(v);
-    gpuSyncthreads();
-    for (int stride = 128; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            float a = amax_sh[tid], b = amax_sh[tid + stride];
-            if (b > a) amax_sh[tid] = b;
-        }
-        gpuSyncthreads();
+    /* absmax: warp shuffles, then the 8 warp maxima through shared memory.
+     * The shared-memory tree it replaces took 8 barriers; at decode, where
+     * each call is one 4096..5120-value row, this kernel was 5.6 us. */
+    __shared__ float amax_sh[8];
+    float amax = fabsf(v);
+    for (int m = 16; m > 0; m >>= 1) {
+        float b = gpuShflXorSync(0xFFFFFFFFu, amax, m);
+        if (b > amax) amax = b;
     }
-    float amax = amax_sh[0];
+    if ((tid & 31) == 0) amax_sh[tid >> 5] = amax;
+    gpuSyncthreads();
+    amax = amax_sh[0];
+    for (int w = 1; w < 8; w++) if (amax_sh[w] > amax) amax = amax_sh[w];
 
     size_t base = (size_t)s * n_super + sb;
     float  *d_out_b    = d_out    + base;
@@ -667,14 +669,11 @@ picolm_quantize_q8_K(float *d_out, int8_t *qs_out, int16_t *bsums_out,
     if (q < -128) q = -128;
     qs_out_b[tid] = (int8_t)q;
 
-    /* bsums: one per group of 16 values. Threads 0..15 each own a group and
-     * can read the qs values they just wrote (same block, after a barrier). */
-    gpuSyncthreads();
-    if (tid < 16) {
-        int acc = 0;
-        for (int j = 0; j < 16; j++) acc += (int)qs_out_b[tid * 16 + j];
-        bsums_b[tid] = (int16_t)acc;
-    }
+    /* bsums: one per group of 16 values = one half-warp, summed with
+     * shuffles (exact integers, so the same sums as reading qs back). */
+    int acc = q;
+    for (int m = 8; m > 0; m >>= 1) acc += gpuShflXorSync(0xFFFFFFFFu, acc, m);
+    if ((tid & 15) == 0) bsums_b[tid >> 4] = (int16_t)acc;
 }
 
 /* ================================================================
