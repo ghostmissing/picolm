@@ -18,6 +18,11 @@ void tensor_set_repacked(const void *ptr);
 #ifdef PICOLM_GPU
 typedef struct picolm_gpu_tensor picolm_gpu_tensor_t;
 void tensor_set_gpu_tensor(picolm_gpu_tensor_t *t, int device);
+/* GPU weight registry, for forwards with no GPU pipeline of their own
+ * (GLM-5): matmul_batch() runs a product of at least PICOLM_GPU_BATCH_MIN
+ * (16) rows on the GPU when W was allowed here, uploading W on first use
+ * with that call's n/d/qtype. Call from the orchestrator thread. */
+void tensor_gpu_allow(const void *W, int device);
 #endif
 
 /* Set number of threads for matmul (default: 1) */

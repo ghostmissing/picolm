@@ -5745,3 +5745,38 @@ size_t model_glm5_state_restore(model_t *m, const uint8_t *buf, size_t buf_size,
     }
     return off;
 }
+
+#ifdef PICOLM_GPU
+/* PICOLM_GPU=1: allow every non-expert weight for the matmul_batch GPU
+ * registry (tensor_gpu_allow), so the batched prefill projections -- KDA
+ * q/k/v and gates, MLA q/kv/out, hyper-connection fn, dense FFN, shared
+ * expert, router, indexer -- run on the GPU. Routed experts stay in host
+ * RAM. The 3D k_b/v_b are multiplied per head on slices: allowing those
+ * slices made 64 small synchronous GPU calls per chunk, slower than the CPU
+ * (v_b 11.5 -> 39 ms per layer on a V100), so they stay on the CPU until
+ * they can run as one batched call. Returns the number of weights allowed. */
+int glm5_gpu_allow_weights(model_t *m, int device) {
+    const model_config_t *c = &m->config;
+    model_weights_t *w = &m->weights;
+    int n = 0;
+#define ALLOW(p) do { if (p) { tensor_gpu_allow((p), device); n++; } } while (0)
+    for (int l = 0; l < c->n_layers; l++) {
+        const layer_weights_t *lw = &w->layers[l];
+        ALLOW(lw->attn_q); ALLOW(lw->attn_k); ALLOW(lw->attn_v); ALLOW(lw->attn_output);
+        ALLOW(lw->ffn_gate); ALLOW(lw->ffn_up); ALLOW(lw->ffn_down);
+        ALLOW(lw->ffn_gate_inp);
+        ALLOW(lw->ffn_gate_shexp); ALLOW(lw->ffn_up_shexp); ALLOW(lw->ffn_down_shexp);
+        if (!w->glm5) continue;
+        const glm5_layer_weights_t *gw = &w->glm5[l];
+        ALLOW(gw->hc_attn_fn); ALLOW(gw->hc_ffn_fn);
+        ALLOW(gw->kda_q); ALLOW(gw->kda_k); ALLOW(gw->kda_v);
+        ALLOW(gw->kda_f_a); ALLOW(gw->kda_f_b); ALLOW(gw->kda_g_a); ALLOW(gw->kda_g_b);
+        ALLOW(gw->kda_beta); ALLOW(gw->kda_out);
+        ALLOW(gw->mla_q_a); ALLOW(gw->mla_q_b); ALLOW(gw->mla_kv_a_mqa); ALLOW(gw->mla_o);
+        ALLOW(gw->idx_proj); ALLOW(gw->idx_attn_k); ALLOW(gw->idx_q_b); ALLOW(gw->idx_gate);
+    }
+    ALLOW(w->output);
+#undef ALLOW
+    return n;
+}
+#endif

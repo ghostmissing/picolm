@@ -99,6 +99,50 @@ void tensor_set_gpu_tensor(picolm_gpu_tensor_t *t, int device) {
     gpu_tensor = t;
     gpu_device = device;
 }
+
+/* Weight registry (tensor_gpu_allow): open addressing on the weight pointer.
+ * t stays NULL until the first eligible matmul_batch() uploads W; a failed
+ * upload or matmul marks the entry so it is not retried. */
+#define GPU_REG_SIZE 8192   /* power of two; a 45-layer GLM-5 allows ~1000 */
+typedef struct { const void *w; picolm_gpu_tensor_t *t; int dev, failed; } gpu_reg_t;
+static gpu_reg_t gpu_reg[GPU_REG_SIZE];
+static int gpu_reg_n = 0;
+
+static gpu_reg_t *gpu_reg_find(const void *w, int insert) {
+    size_t h = ((uintptr_t)w >> 4) * 0x9E3779B97F4A7C15ull;
+    for (int i = 0; i < GPU_REG_SIZE; i++) {
+        gpu_reg_t *e = &gpu_reg[(h + i) & (GPU_REG_SIZE - 1)];
+        if (e->w == w) return e;
+        if (!e->w) {
+            if (!insert || gpu_reg_n >= GPU_REG_SIZE / 2) return NULL;
+            e->w = w; gpu_reg_n++;
+            return e;
+        }
+    }
+    return NULL;
+}
+
+static int gpu_is_orchestrator(void) {
+#ifdef _WIN32
+    return gpu_orchestrator_set && GetCurrentThreadId() == gpu_orchestrator_thread;
+#else
+    return gpu_orchestrator_set && pthread_equal(pthread_self(), gpu_orchestrator_thread);
+#endif
+}
+
+void tensor_gpu_allow(const void *W, int device) {
+    if (!W) return;
+    if (!gpu_orchestrator_set) {
+#ifdef _WIN32
+        gpu_orchestrator_thread = GetCurrentThreadId();
+#else
+        gpu_orchestrator_thread = pthread_self();
+#endif
+        gpu_orchestrator_set = 1;
+    }
+    gpu_reg_t *e = gpu_reg_find(W, 1);
+    if (e) e->dev = device;
+}
 #endif /* PICOLM_GPU */
 
 /* Mac OS X < 10.5 compat: _SC_NPROCESSORS_ONLN may not be defined */
@@ -3526,6 +3570,20 @@ void matmul_batch(float *out, const float *x, int n_batch,
         if (picolm_gpu_matmul(gpu_tensor, out, x, n_batch, gpu_device)) {
             DISPATCH("GPU_host");
             return;
+        }
+    }
+    static int reg_min = 0;
+    if (!reg_min) { const char *e = getenv("PICOLM_GPU_BATCH_MIN"); reg_min = e && atoi(e) > 0 ? atoi(e) : 16; }
+    if (!gpu_tensor && gpu_reg_n && n_batch >= reg_min && d > 0 && n > 0 && !tl_in_parallel && gpu_is_orchestrator()) {
+        gpu_reg_t *e = gpu_reg_find(W, 0);
+        if (e && !e->failed) {
+            if (!e->t && !picolm_gpu_tensor_upload((void **)&e->t, W, qtype, n, d, e->dev)) {
+                e->t = NULL; e->failed = 1;
+            }
+            if (e->t) {
+                if (picolm_gpu_matmul(e->t, out, x, n_batch, e->dev)) { DISPATCH("GPU_registry"); return; }
+                e->failed = 1;
+            }
         }
     }
 #endif

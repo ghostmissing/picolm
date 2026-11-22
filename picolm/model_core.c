@@ -1910,6 +1910,17 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                 fprintf(stderr, "WARN: Falling back to CPU inference\n");
                 goto gpu_skip;
             }
+            /* GLM-5 has no GPU pipeline (el_reason 12 below). Its batched
+             * projections go to the GPU through the matmul_batch weight
+             * registry instead: allow every non-expert weight (uploaded on
+             * first use; routed experts stay in host RAM) and skip the generic
+             * upload, whose llama-shaped handles glm5 never uses. */
+            if (c->is_glm5) {
+                extern int glm5_gpu_allow_weights(model_t *m, int device);
+                fprintf(stderr, "INFO: GLM-5: %d weights eligible for GPU batched matmul (experts stay on CPU)\n",
+                        glm5_gpu_allow_weights(m, device));
+                goto gpu_skip;
+            }
             int q_dim = c->n_heads * c->head_dim;
             int kv_dim = c->n_kv_heads * c->head_dim;
             int uploaded = 0, attempted = 0;
