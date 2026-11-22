@@ -106,6 +106,10 @@ __global__ void picolm_q8_q8_matmul(float *y, const int8_t *xq, const float *xd,
 #define GEMV_THREADS_PER_BLK (GEMV_QI / GEMV_VDR)   /* 4 threads, one block */
 #define GEMV_BLOCKS_PER_ITER (GEMV_VDR * GEMV_WARPS * 32 / GEMV_QI)  /* 32 */
 __global__ void picolm_q8_0_gemv(float *y, const int8_t *xq, const float *xd, const void *weights, int I, int O, int row_bytes, int y_stride);
+/* Up to three Q8_0 GEMVs on the same activation in one launch: matrix i has
+ * its rows in [o_end[i-1], o_end[i]) of the concatenation. */
+typedef struct { const void *w[3]; float *y[3]; int o_end[3]; int n; } picolm_gemv_rows_t;
+__global__ void picolm_q8_0_gemv_rows(picolm_gemv_rows_t rows, const int8_t *xq, const float *xd, int I, int row_bytes);
 
 /* Q8_K activation quantiser: one block per 256-value super-block.
  * d_out/qs_out/bsums_out are arrays of (I/256)*S entries with strides

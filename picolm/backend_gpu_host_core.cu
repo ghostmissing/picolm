@@ -1650,17 +1650,25 @@ kquant_gemv_shared(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t **t, float **y, in
     int all_q8 = 1;
     for (int i = 0; i < n; i++)
         if (!t[i] || !y[i] || t[i]->I != I || t[i]->qtype != GGUF_TYPE_Q8_0) all_q8 = 0;
-    if (all_q8 && I % 32 == 0) {   /* Q8_0: one Q8_0 quantise, n Q8_0 GEMVs */
+    if (all_q8 && I % 32 == 0 && n <= 3) {   /* Q8_0: one quantise, one GEMV launch */
         if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, (size_t)I) ||
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, (size_t)(I / 32) * sizeof(float))) return 0;
         picolm_quantize_q8_0<<<dim3((unsigned)(I / 32), 1), 32, 32 * sizeof(float), ctx->stream>>>(
             ctx->q8_xq, ctx->q8_xd, x_dev, I, 1);
         if (!gpu_ok(gpuGetLastError(), "q8 quantize (shared)")) return 0;
+        picolm_gemv_rows_t rows;   /* one launch over all n matrices */
+        int end = 0;
+        for (int i = 0; i < 3; i++) {
+            rows.w[i] = i < n ? t[i]->weights : NULL;
+            rows.y[i] = i < n ? y[i] : NULL;
+            if (i < n) end += t[i]->O;
+            rows.o_end[i] = end;
+        }
+        rows.n = n;
         int _ps = picolm_gpu_prof_slot("gemv_q8_0");
         picolm_gpu_prof_begin(ctx->device);
-        for (int i = 0; i < n; i++)
-            picolm_q8_0_gemv<<<dim3((unsigned)t[i]->O), 32 * GEMV_WARPS, 0, ctx->stream>>>(
-                y[i], ctx->q8_xq, ctx->q8_xd, t[i]->weights, I, t[i]->O, (int)t[i]->row_bytes, t[i]->O);
+        picolm_q8_0_gemv_rows<<<dim3((unsigned)end), 32 * GEMV_WARPS, 0, ctx->stream>>>(
+            rows, ctx->q8_xq, ctx->q8_xd, I, (int)t[0]->row_bytes);
         picolm_gpu_prof_end(_ps);
         return gpu_ok(gpuGetLastError(), "q8 gemv (shared)");
     }

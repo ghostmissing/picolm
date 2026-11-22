@@ -718,20 +718,31 @@ __device__ static inline int gemv_get_int_b2(const int8_t *qs, int i32) {
     return x32;
 }
 
-__global__ void
-picolm_q8_0_gemv(float *y,
-                 const int8_t *xq, const float *xd,
-                 const void *weights,
-                 int I, int O, int row_bytes, int y_stride) {
+/* Row g of the concatenated matrices in r (g < r.o_end[r.n-1]): its weights,
+ * and where its result goes (*yp = y + local row). One launch over Q/K/V or
+ * gate/up instead of one per matrix saved ~10 us per layer on a V100 (the
+ * small K/V GEMVs cannot fill the card on their own). Q8_0 only: fusing the
+ * warp-per-row K-quant GEMVs measured no gain (Q6_K: 2% slower).
+ * Selected with conditionals: indexing r.w[s] with a runtime s puts the
+ * struct in local memory and the weight loads through generic addresses,
+ * which made the kernel 3x slower. */
+__device__ static inline const uint8_t *
+q8_rows_pick(const picolm_gemv_rows_t &r, int g, int row_bytes, float **yp) {
+    const int s1 = r.n > 1 && g >= r.o_end[0], s2 = r.n > 2 && g >= r.o_end[1];
+    const void *w = s2 ? r.w[2] : s1 ? r.w[1] : r.w[0];
+    float *y      = s2 ? r.y[2] : s1 ? r.y[1] : r.y[0];
+    const int o   = g - (s2 ? r.o_end[1] : s1 ? r.o_end[0] : 0);
+    *yp = y + o;
+    return (const uint8_t *)w + (size_t)o * row_bytes;
+}
+
+/* One output row per block: *yo = wrow . x. */
+__device__ static inline void
+q8_0_gemv_row(float *yo, const int8_t *xq, const float *xd, const uint8_t *wrow, int I) {
     const int lane = (int)(gpuThreadIdx_x & 31);
     const int warp = (int)(gpuThreadIdx_x >> 5);
     const int tid  = warp * 32 + lane;          /* 0 .. 32*GEMV_WARPS-1 */
-    const int o    = (int)gpuBlockIdx_x;        /* one row per block */
-    if (o >= O) return;
-    int ys = y_stride > 0 ? y_stride : O;
-
     const int n_blocks = I / 32;
-    const uint8_t *wrow = (const uint8_t *)weights + (size_t)o * row_bytes;
 
     /* Which block this thread starts on, and which int pair within it. */
     const int kbx0 = tid / GEMV_THREADS_PER_BLK;
@@ -775,7 +786,31 @@ picolm_q8_0_gemv(float *y,
     for (int off = 16; off > 0; off >>= 1)
         sumf += gpuShflXorSync(0xFFFFFFFFu, sumf, off);
 
-    if (lane == 0) y[o] = sumf;
+    if (lane == 0) *yo = sumf;
+}
+
+__global__ void
+picolm_q8_0_gemv(float *y,
+                 const int8_t *xq, const float *xd,
+                 const void *weights,
+                 int I, int O, int row_bytes, int y_stride) {
+    (void)y_stride;
+    const int o = (int)gpuBlockIdx_x;
+    if (o >= O) return;
+    q8_0_gemv_row(y + o, xq, xd, (const uint8_t *)weights + (size_t)o * row_bytes, I);
+}
+
+/* The same over up to three matrices concatenated (Q/K/V, gate/up): one
+ * launch, grid = total rows. */
+__global__ void
+picolm_q8_0_gemv_rows(picolm_gemv_rows_t rows, const int8_t *xq, const float *xd,
+                      int I, int row_bytes) {
+    const int g = (int)gpuBlockIdx_x;
+    const int O = rows.n > 2 ? rows.o_end[2] : rows.n > 1 ? rows.o_end[1] : rows.o_end[0];
+    if (g >= O) return;
+    float *y;
+    const uint8_t *wrow = q8_rows_pick(rows, g, row_bytes, &y);
+    q8_0_gemv_row(y, xq, xd, wrow, I);
 }
 
 /* ================================================================
