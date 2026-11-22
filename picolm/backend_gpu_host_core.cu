@@ -1571,10 +1571,11 @@ picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, int d
 /* Q8_K activation scratch + one GEMV launch, shared by the Q5_K and Q6_K
  * decode paths. Returns 1 on success, 0 to let the caller fall back to the
  * IMMA tile paths (which still use Q8_0 activations). */
-/* IQ6_K prefill on Volta tensor cores: Q8_K-quantise the S activation rows
- * (same quantiser as the GEMV), then picolm_iq6_k_q8_K_matmul_hmma. */
+/* K-quant / IQ6_K prefill on Volta tensor cores: Q8_K-quantise the S
+ * activation rows (same quantiser as the GEMVs), then
+ * picolm_iq6_k_q8_K_matmul_hmma or picolm_kq_q8_K_matmul_hmma. */
 static int
-iq6_k_hmma_dev(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t *t, float *y_dev,
+kquant_hmma_dev(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t *t, float *y_dev,
                const float *x_dev, int S, int I, int O, int ys) {
     const int n_super = I / 256;
     size_t qs_bytes    = (size_t)S * I;
@@ -1591,12 +1592,19 @@ iq6_k_hmma_dev(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t *t, float *y_dev,
     }
     picolm_quantize_q8_K<<<dim3((unsigned)n_super, (unsigned)S), 256, 0, ctx->stream>>>(
         ctx->q8_xd, ctx->q8_xq, ctx->q8_k_bsums, x_dev, I, S);
-    if (!gpu_ok(gpuGetLastError(), "q8_K quantize (iq6_k hmma)")) return 0;
-    gpu_dispatch_print("matmul_iq6_hmma_dev");
+    if (!gpu_ok(gpuGetLastError(), "q8_K quantize (k-quant hmma)")) return 0;
     dim3 grid((unsigned)((O + 63) / 64), (unsigned)((S + 127) / 128));
-    picolm_iq6_k_q8_K_matmul_hmma<<<grid, 128, 0, ctx->stream>>>(
-        y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
-    return gpu_ok(gpuGetLastError(), "iq6_k matmul hmma (dev)");
+    if (t->qtype == GGUF_TYPE_IQ6_K) {
+        gpu_dispatch_print("matmul_iq6_hmma_dev");
+        picolm_iq6_k_q8_K_matmul_hmma<<<grid, 128, 0, ctx->stream>>>(
+            y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
+    } else {
+        gpu_dispatch_print("matmul_kq_hmma_dev");
+        picolm_kq_q8_K_matmul_hmma<<<grid, 128, 0, ctx->stream>>>(
+            y_dev, ctx->q8_xq, ctx->q8_xd, ctx->q8_k_bsums, t->weights, (int)t->qtype,
+            S, I, O, (int)t->row_bytes, ys);
+    }
+    return gpu_ok(gpuGetLastError(), "k-quant matmul hmma (dev)");
 }
 
 static int
@@ -1909,7 +1917,7 @@ matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
             return 1;
         /* S > 1 on Volta: tensor cores. PICOLM_NO_Q8_HMMA=1 keeps the dequant path. */
         if (S > 1 && ctx->has_hmma && picolm_gpu_q8_hmma() && (x_stride <= 0 || x_stride == I) &&
-            iq6_k_hmma_dev(ctx, t, y_dev, x_dev, S, I, O, ys))
+            kquant_hmma_dev(ctx, t, y_dev, x_dev, S, I, O, ys))
             return 1;
     }
 
@@ -1917,6 +1925,13 @@ matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
      * used to be the only way in (see the host path). */
     if (S == 1 && O >= 8 && I % 256 == 0 && kquant_which(t->qtype) && !picolm_gpu_no_gemv() &&
         kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, kquant_which(t->qtype)))
+        return 1;
+    /* K-quant prefill (S > 1) on Volta tensor cores. PICOLM_NO_Q8_HMMA=1
+     * keeps the paths below. */
+    if (S > 1 && ctx->has_hmma && picolm_gpu_q8_hmma() && (x_stride <= 0 || x_stride == I) &&
+        O >= 8 && I % 256 == 0 &&
+        (t->qtype == GGUF_TYPE_Q4_K || t->qtype == GGUF_TYPE_Q5_K || t->qtype == GGUF_TYPE_Q6_K) &&
+        kquant_hmma_dev(ctx, t, y_dev, x_dev, S, I, O, ys))
         return 1;
 
     if (t->qtype == GGUF_TYPE_Q2_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
