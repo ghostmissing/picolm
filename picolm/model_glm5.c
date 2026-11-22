@@ -3384,7 +3384,8 @@ static int ep_grow(void **p, size_t *cap, size_t bytes) {
 /* Returns 1 if it handled the layer, 0 to fall back to the reference path (nothing was written). */
 static int glm5_moe_ffn_batch_ep(const model_t *m, const glm5_layer_weights_t *gw,
                                  const layer_weights_t *lw, run_state_t *s,
-                                 const float *cur_b, float *out_b, int NT, int layer_idx)
+                                 const float *cur_b, float *out_b, int NT, int layer_idx,
+                                 int gpu_moe_try)
 {
     const model_config_t *c = &m->config;
     const int D = c->n_embd, NE = c->n_expert, AK = c->n_expert_used, FF = c->n_ff_exp;
@@ -3395,12 +3396,6 @@ static int glm5_moe_ffn_batch_ep(const model_t *m, const glm5_layer_weights_t *g
     const int cpu_multi_ok = tensor_matmul_batch_multi_ok(lw->type_ffn_gate_exps, D, FF) &&
                              tensor_matmul_batch_multi_ok(lw->type_ffn_up_exps, D, FF) &&
                              tensor_matmul_batch_multi_ok(lw->type_ffn_down_exps, FF, D);
-    int gpu_moe_try = 0;
-#ifdef PICOLM_GPU
-    { static int moe_min = 0;
-      if (!moe_min) { const char *e = getenv("PICOLM_GLM5_GPU_MOE_MIN"); moe_min = e && atoi(e) > 0 ? atoi(e) : 64; }
-      gpu_moe_try = glm5_gpu_dev >= 0 && NT >= moe_min; }
-#endif
     if (!cpu_multi_ok && !gpu_moe_try) return 0;
 
     /* persistent buffers: no malloc/free (and page faults) per layer */
@@ -3545,7 +3540,7 @@ static int glm5_moe_ffn_batch_ep(const model_t *m, const glm5_layer_weights_t *g
         fprintf(stderr, "[moechk L%d] out_b rms=%.6f (routed+shared)\n", layer_idx, (float)sqrt(ss/m->config.n_embd));
     }
     EPP_END(t_all, EPP_TOTAL);
-    return 1;
+    return moe_gpu_done ? 2 : 1;   /* 2: the experts ran on the GPU */
 }
 
 /* Dispatcher: the expert-parallel path when enabled and applicable, else the reference. */
@@ -3560,7 +3555,42 @@ static void glm5_moe_ffn_batch(const model_t *m, const glm5_layer_weights_t *gw,
         fprintf(stderr, "[moechk L%d] moe_in rms=%.6f  ep_enabled=%d\n", layer_idx,
                 (float)sqrt(ss/m->config.n_embd), glm5_moe_ep_enabled());
     }
-    if (glm5_moe_ep_enabled() && glm5_moe_ffn_batch_ep(m, gw, lw, s, cur_b, out_b, n_tokens, layer_idx)) {
+    int gpu_try = 0;
+#ifdef PICOLM_GPU
+    /* Streaming a layer's experts to the GPU costs a fixed upload (bytes /
+     * PCIe), the CPU a cost per token, so the GPU only wins above a break-even
+     * chunk size that depends on the machine (the rental's PCIe 5 vs a home
+     * V100's PCIe 3 against a many-core EPYC). Measure it: the first eligible
+     * call runs on the GPU (its time ~ the upload), the next on the CPU path
+     * that would otherwise run (ms per token), then the GPU takes chunks of
+     * >= upload / cpu_per_token tokens. PICOLM_GLM5_GPU_MOE=0/1 forces it
+     * off/on; PICOLM_GLM5_GPU_MOE_MIN (64) is the smallest chunk considered. */
+    static int moe_force = -2, moe_min = 0, moe_phase = 0;
+    static double moe_gpu_ms = 0.0, moe_cpu_ms_tok = 0.0;
+    if (moe_force == -2) {
+        const char *e = getenv("PICOLM_GLM5_GPU_MOE"); moe_force = e ? atoi(e) != 0 : -1;
+        e = getenv("PICOLM_GLM5_GPU_MOE_MIN"); moe_min = e && atoi(e) > 0 ? atoi(e) : 64;
+    }
+    const int moe_elig = glm5_gpu_dev >= 0 && n_tokens >= moe_min && moe_force != 0;
+    if (moe_elig) {
+        if (moe_force == 1 || moe_phase == 0) gpu_try = 1;
+        else if (moe_phase == 1) gpu_try = 0;
+        else gpu_try = moe_gpu_ms <= moe_cpu_ms_tok * n_tokens;
+    }
+    const int moe_measure = moe_elig && moe_force == -1 && moe_phase < 2;
+    const double moe_t0 = moe_measure ? glm5_prof_now() : 0.0;
+#define MOE_MEASURE_END(gpu_used) do { if (moe_measure) { const double ms_ = glm5_prof_now() - moe_t0; \
+        if (moe_phase == 0 && (gpu_used)) { moe_gpu_ms = ms_; moe_phase = 1; } \
+        else if (moe_phase == 1 && !(gpu_used)) { moe_cpu_ms_tok = ms_ / n_tokens; moe_phase = 2; \
+            fprintf(stderr, "INFO: GLM-5 expert streaming: GPU %.1f ms/layer vs CPU %.3f ms/token -> GPU for chunks >= %d tokens\n", \
+                    moe_gpu_ms, moe_cpu_ms_tok, moe_cpu_ms_tok > 0 ? (int)(moe_gpu_ms / moe_cpu_ms_tok) + 1 : 0); } } } while (0)
+#else
+#define MOE_MEASURE_END(gpu_used) do { } while (0)
+#endif
+    int ep_rc = 0;
+    if ((glm5_moe_ep_enabled() || gpu_try) &&
+        (ep_rc = glm5_moe_ffn_batch_ep(m, gw, lw, s, cur_b, out_b, n_tokens, layer_idx, gpu_try))) {
+        MOE_MEASURE_END(ep_rc == 2);
         if (prof) { g_epp_mode = 1; g_epp_calls++; }
         /* Report the batched MoE output so a prefill can be diffed against
          * ik's ffn_moe_out-<il> at all; without this the whole FFN was
@@ -3575,6 +3605,7 @@ static void glm5_moe_ffn_batch(const model_t *m, const glm5_layer_weights_t *gw,
     }
     const double t0 = prof ? glm5_prof_now() : 0.0;
     glm5_moe_ffn_batch_ref(m, gw, lw, s, cur_b, out_b, n_tokens, layer_idx);
+    MOE_MEASURE_END(0);
     if (prof) { g_epp_mode = 0; g_epp_calls++; g_epp_ms[EPP_TOTAL] += glm5_prof_now() - t0; }
     if (glm5_stats_wanted()) {
         char t2[96];
