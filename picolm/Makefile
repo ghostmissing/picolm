@@ -531,6 +531,10 @@ CUDA_OBJS := $(GPU_SRCS:%.cu=%-cuda.o)
 test-q8-gemm-gpu: tests/test_q8_gemm_gpu.cu backend_gpu_kernels-cuda.o
 	$(NVCC) $(CUDAFLAGS) $(CUDA_GENCODE) -DPICOLM_GPU=1 -o test_q8_gemm_gpu $^ -I.
 
+# GPU check: GLM-5 KDA prefill tail (picolm_gpu_glm5_kda_tail) against a C reference.
+test-glm5-kda-gpu: tests/test_glm5_kda_gpu.cu $(CUDA_OBJS)
+	$(NVCC) $(CUDAFLAGS) $(CUDA_GENCODE) -DPICOLM_GPU=1 -DPICOLM_CUDA=1 -o test_glm5_kda_gpu $^ -I. -lcudart
+
 # GPU check: Volta tensor-core attention agrees with the scalar kernel.
 test-attn-hmma-gpu: tests/test_attn_hmma_gpu.cu backend_gpu_kernels-cuda.o
 	$(NVCC) $(CUDAFLAGS) $(CUDA_GENCODE) -DPICOLM_GPU=1 -o test_attn_hmma_gpu $^ -I.

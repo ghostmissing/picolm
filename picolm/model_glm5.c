@@ -21,6 +21,11 @@
 #include <stdio.h>
 #include <time.h>
 #include <assert.h>
+#ifdef PICOLM_GPU
+#include "backend_gpu.h"
+/* >= 0: PICOLM_GPU hybrid active on this device (glm5_gpu_allow_weights). */
+static int glm5_gpu_dev = -1;
+#endif
 
 #ifdef PICOLM_VIZ
 #include "viz.h"
@@ -5317,6 +5322,18 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                  * tail's output projection is deferred so attn_output can be
                  * GEMM'd for all tokens at once below. */
                 PFP_BEGIN(tKT);
+#ifdef PICOLM_GPU
+                /* PICOLM_GPU hybrid: the whole tail on the GPU (one block per
+                 * head, state in shared memory); falls through on failure. */
+                if (!(glm5_gpu_dev >= 0 && n_tokens >= 16 &&
+                      picolm_gpu_glm5_kda_tail(glm5_gpu_dev, n_tokens, H, KD, c->ssm_d_conv,
+                          q_b, k_b, v_b, gb_b, fb_b, beta_b,
+                          (const float *)gw->kda_conv_q, (const float *)gw->kda_conv_k,
+                          (const float *)gw->kda_conv_v, (const float *)gw->kda_dt_bias,
+                          (const float *)gw->kda_a, (const float *)gw->kda_norm,
+                          c->glm5_kda_lower_bound, c->rms_norm_eps,
+                          s->glm5.kda_conv_state[il], s->glm5.kda_state[il], head_b)))
+#endif
                 if (!(glm5_pf_par() && glm5_kda_layer_split(m, gw, s, il, n_tokens, q_b, k_b, v_b, gb_b, fb_b,
                                                           beta_b, conv_b, g_scr, head_b, beta_sh)))
                 for (int t = 0; t < n_tokens; t++) {
@@ -5757,6 +5774,7 @@ size_t model_glm5_state_restore(model_t *m, const uint8_t *buf, size_t buf_size,
  * they can run as one batched call. Returns the number of weights allowed. */
 int glm5_gpu_allow_weights(model_t *m, int device) {
     const model_config_t *c = &m->config;
+    glm5_gpu_dev = device;
     model_weights_t *w = &m->weights;
     int n = 0;
 #define ALLOW(p) do { if (p) { tensor_gpu_allow((p), device); n++; } } while (0)

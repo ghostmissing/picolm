@@ -623,6 +623,16 @@ uint16_t *picolm_gpu_kv_k_dev(int device);
 uint16_t *picolm_gpu_kv_v_dev(int device);
 
 /* Device-native rmsnorm: x/out/weight are device pointers, no H2D/D2H, no sync. */
+/* GLM-5 KDA prefill tail (conv1d+SiLU, L2 norm, gated delta-rule recurrence,
+ * RMSNorm, sigmoid gate) for N tokens in order; host pointers; conv_state and
+ * state are updated in place. Returns 0 if unsupported (KD != 128). */
+int picolm_gpu_glm5_kda_tail(int device, int N, int H, int KD, int CK,
+                             const float *q, const float *k, const float *v,
+                             const float *z, const float *raw, const float *beta_raw,
+                             const float *wq, const float *wk, const float *wv,
+                             const float *dt_bias, const float *a, const float *norm_w,
+                             float lower_bound, float eps,
+                             float *conv_state, float *state, float *out);
 int picolm_gpu_rmsnorm_dev(float *out, const float *x, const float *weight,
                             int dim, float eps, int device);
 /* Host-side rmsnorm: takes host pointers, does H2D/D2H/sync. */

@@ -2941,3 +2941,148 @@ extern "C" void picolm_gpu_prof_report(void) {
                 g_prof[k].calls ? g_prof[k].total_ms / g_prof[k].calls : 0.0);
     }
 }
+
+
+/* ================================================================
+ * GLM-5 KDA tail (prefill): conv1d + SiLU, L2 norm, gated delta-rule
+ * recurrence, RMSNorm and sigmoid gate, for n_tokens in order.
+ * ================================================================
+ *
+ * GPU port of glm5_kda_head_task() (model_glm5.c), the sequential part of a
+ * KDA layer's prefill after its batched projections. One block per head, one
+ * thread per state row / channel (KD = 128); the head's KD x KD state
+ * (column-major, Sh[col*KD + row], as on the CPU) lives in shared memory for
+ * the whole chunk. Inputs and outputs are host arrays: the state is read and
+ * written back so the CPU decode continues from it. Not bit-identical to the
+ * CPU (summation order, FMA); within ~1e-5, make test-glm5-kda-gpu. */
+#define G5K_KD 128
+
+__device__ static inline float g5k_block_sum(float v, float *red) {
+    for (int o = 16; o > 0; o >>= 1) v += gpuShflXorSync(0xFFFFFFFFu, v, o);
+    const int lane = gpuThreadIdx_x & 31, w = gpuThreadIdx_x >> 5;
+    __syncthreads();
+    if (lane == 0) red[w] = v;
+    __syncthreads();
+    float t = 0.0f;
+    for (int i = 0; i < G5K_KD / 32; i++) t += red[i];
+    return t;
+}
+
+__global__ void __launch_bounds__(G5K_KD)
+picolm_glm5_kda_tail_kernel(const float *q, const float *k, const float *v,
+                            const float *z, const float *raw, const float *beta_raw,
+                            const float *wq, const float *wk, const float *wv,
+                            const float *dt_bias, const float *a, const float *norm_w,
+                            float *conv_state, float *state, float *out,
+                            int N, int H, int CK, float lower_bound, float eps) {
+    extern __shared__ float g5k_sh[];
+    float *S = g5k_sh;                       /* [KD*KD] */
+    float *kd = S + G5K_KD * G5K_KD, *qd = kd + G5K_KD, *kk = qd + G5K_KD, *dd = kk + G5K_KD;
+    float *red = dd + G5K_KD;                /* [KD/32] */
+    const int h = gpuBlockIdx_x, i = gpuThreadIdx_x, KD = G5K_KD, DI = H * KD, CD = 3 * DI;
+    const int ch = h * KD + i;
+    float *Sh = state + (size_t)h * KD * KD;
+    for (int c = 0; c < KD; c++) S[c * KD + i] = Sh[c * KD + i];
+    float cs[3][3];                          /* conv state, CK <= 4 */
+    for (int p = 0; p < 3; p++)
+        for (int t = 0; t < CK - 1; t++) cs[p][t] = conv_state[(size_t)t * CD + p * DI + ch];
+    const float scale = 1.0f / sqrtf((float)KD), a_h = a[h], dtb = dt_bias[ch], nw = norm_w[i];
+    const float *w3[3] = { wq, wk, wv };
+    for (int t = 0; t < N; t++) {
+        const size_t o = (size_t)t * DI + ch;
+        const float beta = 1.0f / (1.0f + expf(-beta_raw[(size_t)t * H + h]));
+        const float g = lower_bound * (1.0f / (1.0f + expf(a_h * (raw[o] + dtb))));
+        float xv[3] = { q[o], k[o], v[o] }, co[3];
+        for (int p = 0; p < 3; p++) {
+            float acc = 0.0f;
+            for (int tt = 0; tt < CK - 1; tt++) acc += cs[p][tt] * w3[p][tt + ch * CK];
+            acc += xv[p] * w3[p][(CK - 1) + ch * CK];
+            co[p] = acc / (1.0f + expf(-acc));
+            for (int tt = 0; tt < CK - 2; tt++) cs[p][tt] = cs[p][tt + 1];
+            cs[p][CK - 2] = xv[p];
+        }
+        const float sq = g5k_block_sum(co[0] * co[0], red);
+        const float sk = g5k_block_sum(co[1] * co[1], red);
+        const float qi = co[0] * (1.0f / fmaxf(sqrtf(sq), 1e-5f));
+        const float ki = co[1] * (1.0f / fmaxf(sqrtf(sk), 1e-5f));
+        const float vi = co[2];
+        const float attn = g5k_block_sum(ki * qi, red) * scale;
+        const float dec = expf(fminf(g, 50.0f));
+        kd[i] = ki * dec; qd[i] = qi * dec; kk[i] = ki; dd[i] = dec;
+        __syncthreads();
+        float vp = 0.0f, ov = 0.0f;
+        for (int c = 0; c < KD; c++) {
+            const float st = S[c * KD + i];
+            vp += st * kd[c];
+            ov += st * qd[c];
+        }
+        const float vn = beta * (vi - vp);
+        ov = ov * scale + vn * attn;
+        for (int c = 0; c < KD; c++) {
+            const float st = dd[c] * S[c * KD + i] + vn * kk[c];
+            S[c * KD + i] = fminf(fmaxf(st, -1e6f), 1e6f);
+        }
+        const float ss = g5k_block_sum(ov * ov, red);
+        const float inv = 1.0f / sqrtf(ss / KD + eps);
+        out[o] = ov * inv * nw * (1.0f / (1.0f + expf(-z[o])));
+        __syncthreads();   /* kd/qd/kk/dd are rewritten next token */
+    }
+    for (int c = 0; c < KD; c++) Sh[c * KD + i] = S[c * KD + i];
+    for (int p = 0; p < 3; p++)
+        for (int t = 0; t < CK - 1; t++) conv_state[(size_t)t * CD + p * DI + ch] = cs[p][t];
+}
+
+/* Host wrapper: all pointers are host memory. Returns 0 (caller keeps the CPU
+ * path) if the shape is unsupported or a CUDA call fails. */
+extern "C" int
+picolm_gpu_glm5_kda_tail(int device, int N, int H, int KD, int CK,
+                         const float *q, const float *k, const float *v,
+                         const float *z, const float *raw, const float *beta_raw,
+                         const float *wq, const float *wk, const float *wv,
+                         const float *dt_bias, const float *a, const float *norm_w,
+                         float lower_bound, float eps,
+                         float *conv_state, float *state, float *out) {
+    if (KD != G5K_KD || CK < 2 || CK > 4 || N < 1 || H < 1) return 0;
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    const size_t DI = (size_t)H * KD, act = (size_t)N * DI, cw = DI * CK;
+    const size_t cst = (size_t)(CK - 1) * 3 * DI, st = (size_t)H * KD * KD;
+    const size_t total = 6 * act + (size_t)N * H + 3 * cw + DI + H + KD + cst + st;
+    static float *buf[PICOLM_GPU_MAX_DEVICES]; static size_t cap[PICOLM_GPU_MAX_DEVICES];
+    const int di = device < PICOLM_GPU_MAX_DEVICES ? device : 0;
+    if (cap[di] < total) {
+        if (buf[di]) gpuFree(buf[di]);
+        buf[di] = NULL; cap[di] = 0;
+        if (!gpu_ok(gpuMalloc((void **)&buf[di], total * sizeof(float)), "glm5 kda tail alloc")) return 0;
+        cap[di] = total;
+    }
+    float *p = buf[di];
+    float *dq = p; p += act; float *dk = p; p += act; float *dv = p; p += act;
+    float *dz = p; p += act; float *draw = p; p += act; float *dout = p; p += act;
+    float *dbeta = p; p += (size_t)N * H;
+    float *dwq = p; p += cw; float *dwk = p; p += cw; float *dwv = p; p += cw;
+    float *ddt = p; p += DI; float *da = p; p += H; float *dnw = p; p += KD;
+    float *dcs = p; p += cst; float *dst = p;
+    const struct { float *d; const float *h; size_t n; } up[] = {
+        { dq, q, act }, { dk, k, act }, { dv, v, act }, { dz, z, act }, { draw, raw, act },
+        { dbeta, beta_raw, (size_t)N * H }, { dwq, wq, cw }, { dwk, wk, cw }, { dwv, wv, cw },
+        { ddt, dt_bias, DI }, { da, a, (size_t)H }, { dnw, norm_w, (size_t)KD },
+        { dcs, conv_state, cst }, { dst, state, st } };
+    for (size_t j = 0; j < sizeof up / sizeof up[0]; j++)
+        if (!gpu_ok(gpuMemcpyAsync(up[j].d, up[j].h, up[j].n * sizeof(float), gpuMemcpyHostToDevice, ctx->stream), "glm5 kda tail H2D")) return 0;
+    const size_t smem = ((size_t)KD * KD + 4 * KD + KD / 32) * sizeof(float);
+    static int attr_set[PICOLM_GPU_MAX_DEVICES];
+    if (!attr_set[di]) {
+        if (!gpu_ok(gpuFuncSetAttribute((const void *)picolm_glm5_kda_tail_kernel,
+                    gpuFuncAttributeMaxDynamicSharedMemorySize, (int)smem), "glm5 kda tail smem")) return 0;
+        attr_set[di] = 1;
+    }
+    picolm_glm5_kda_tail_kernel<<<H, KD, smem, ctx->stream>>>(dq, dk, dv, dz, draw, dbeta, dwq, dwk, dwv,
+        ddt, da, dnw, dcs, dst, dout, N, H, CK, lower_bound, eps);
+    if (!gpu_ok(gpuGetLastError(), "glm5 kda tail kernel")) return 0;
+    if (!gpu_ok(gpuMemcpyAsync(out, dout, act * sizeof(float), gpuMemcpyDeviceToHost, ctx->stream), "glm5 kda tail D2H") ||
+        !gpu_ok(gpuMemcpyAsync(state, dst, st * sizeof(float), gpuMemcpyDeviceToHost, ctx->stream), "glm5 kda tail D2H") ||
+        !gpu_ok(gpuMemcpyAsync(conv_state, dcs, cst * sizeof(float), gpuMemcpyDeviceToHost, ctx->stream), "glm5 kda tail D2H"))
+        return 0;
+    return gpu_ok(gpuStreamSynchronize(ctx->stream), "glm5 kda tail sync");
+}
