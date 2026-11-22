@@ -468,7 +468,12 @@ typedef struct {
 #define GLM5_FAST_F16 1
 #endif
 
-#define GLM5_PREFILL_MAX_TOKENS 512
+/* Tokens per batched GLM-5 prefill chunk: PICOLM_GLM5_UBATCH (16..8192),
+ * default 512. Larger chunks pay off with the PICOLM_GPU hybrid, whose
+ * expert streaming costs a fixed upload per chunk; the scratch arena grows
+ * with it (roughly linearly, ~1 GB per 2K tokens at GLM-5.3 width). Read once. */
+int glm5_prefill_max_tokens(void);
+#define GLM5_PREFILL_MAX_TOKENS glm5_prefill_max_tokens()
 
 /* Tokens per batched-prefill compute chunk ("ubatch" in llama.cpp terms).
  *

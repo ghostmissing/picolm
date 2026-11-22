@@ -143,6 +143,18 @@ static void pp_report(int n_tokens, int n_layers) {
 /* Tokens per batched-prefill compute chunk. See model.h for why this is
  * shared between the allocator and the forward pass. Cached because it is
  * read from an allocation path and from a per-prefill-call path. */
+int glm5_prefill_max_tokens(void) {
+    static int cached = 0;
+    if (cached > 0) return cached;
+    const char *ev = getenv("PICOLM_GLM5_UBATCH");
+    int n = ev ? atoi(ev) : 0;
+    if (n <= 0) n = 512;
+    if (n < 16) n = 16;
+    if (n > 8192) n = 8192;
+    cached = n;
+    return cached;
+}
+
 int picolm_prefill_ubatch(void) {
     static int cached = 0;
     if (cached > 0) return cached;
