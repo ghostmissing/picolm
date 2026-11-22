@@ -3390,9 +3390,18 @@ static int glm5_moe_ffn_batch_ep(const model_t *m, const glm5_layer_weights_t *g
     const int D = c->n_embd, NE = c->n_expert, AK = c->n_expert_used, FF = c->n_ff_exp;
     const float clamp_v = glm5_clamp_value(c);
     if (NT < 2 || NE > 512 || NE < 1 || AK < 1) return 0;
-    if (!tensor_matmul_batch_multi_ok(lw->type_ffn_gate_exps, D, FF) ||
-        !tensor_matmul_batch_multi_ok(lw->type_ffn_up_exps, D, FF) ||
-        !tensor_matmul_batch_multi_ok(lw->type_ffn_down_exps, FF, D)) return 0;
+    /* The CPU expert GEMMs below need tensor_matmul_batch_multi; the GPU path
+     * does not, so with the hybrid on this only decides the fallback. */
+    const int cpu_multi_ok = tensor_matmul_batch_multi_ok(lw->type_ffn_gate_exps, D, FF) &&
+                             tensor_matmul_batch_multi_ok(lw->type_ffn_up_exps, D, FF) &&
+                             tensor_matmul_batch_multi_ok(lw->type_ffn_down_exps, FF, D);
+    int gpu_moe_try = 0;
+#ifdef PICOLM_GPU
+    { static int moe_min = 0;
+      if (!moe_min) { const char *e = getenv("PICOLM_GLM5_GPU_MOE_MIN"); moe_min = e && atoi(e) > 0 ? atoi(e) : 64; }
+      gpu_moe_try = glm5_gpu_dev >= 0 && NT >= moe_min; }
+#endif
+    if (!cpu_multi_ok && !gpu_moe_try) return 0;
 
     /* persistent buffers: no malloc/free (and page faults) per layer */
     static int *sel, *count, *cursor, *bucket, *inv, *single, *multi; static float *wts, *xg, *gu, *gu2, *dwn;
@@ -3436,6 +3445,23 @@ static int glm5_moe_ffn_batch_ep(const model_t *m, const glm5_layer_weights_t *g
     const size_t gate_stride = (size_t)FF * gguf_type_row_size(lw->type_ffn_gate_exps, D);
     const size_t down_stride = (size_t)D  * gguf_type_row_size(lw->type_ffn_down_exps, FF);
     ep_single_t sc = { lw, single, cursor, xg, gu, gu2, dwn, gate_stride, down_stride, D, FF, 0 };
+    int moe_gpu_done = 0;
+#ifdef PICOLM_GPU
+    /* PICOLM_GPU hybrid: gate/up, SwiGLU and down of every routed expert on the
+     * GPU, streaming the layer's expert weights from RAM. Pays for its upload
+     * only with enough tokens per chunk (PICOLM_GLM5_GPU_MOE_MIN, default 64). */
+    {
+      if (gpu_moe_try) {
+          EPP_BEGIN(tg);
+          moe_gpu_done = picolm_gpu_moe_experts(glm5_gpu_dev, NE, count, cursor, (int)pairs, D, FF, xg,
+              lw->ffn_gate_exps, lw->ffn_up_exps, lw->ffn_down_exps,
+              (int)lw->type_ffn_gate_exps, (int)lw->type_ffn_up_exps, (int)lw->type_ffn_down_exps,
+              gate_stride, down_stride, clamp_v, dwn);
+          EPP_END(tg, EPP_GATEUP);
+      } }
+#endif
+    if (!moe_gpu_done && !cpu_multi_ok) return 0;   /* reference path takes over */
+    if (!moe_gpu_done) {
 
     /* 3. gate/up: single-token experts via matmul() (as the reference), the rest in ONE call */
     EPP_BEGIN(t2);
@@ -3474,6 +3500,7 @@ static int glm5_moe_ffn_batch_ep(const model_t *m, const glm5_layer_weights_t *g
     EPP_BEGIN(t6);
     if (n_single) { sc.phase = 1; tensor_parallel_for_dyn(n_single, ep_single_task, &sc); }
     EPP_END(t6, EPP_SINGLES);
+    }
 
     /* 6. reduce slots in order 0..AK-1 per token, exactly like the reference */
     EPP_BEGIN(t7);

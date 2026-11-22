@@ -2928,3 +2928,96 @@ int picolm_gpu_w4a16_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, in
 }
 
 /* ---- SSM recurrence API ---- */
+
+
+/* ================================================================
+ * GLM-5 routed experts of a prefill chunk on the GPU
+ * ================================================================
+ *
+ * glm5_moe_ffn_batch_ep() routes and gathers the chunk's (token, slot) rows
+ * sorted by expert: expert e owns rows [cursor[e], cursor[e] + count[e]) of
+ * xg. This uploads the layer's three expert tensors (weights stay in host RAM
+ * between chunks: it streams them, about 4 GB per layer at GLM-5.3-Flash Q4)
+ * and the rows, runs gate/up, the clamped SwiGLU and down per expert on views
+ * into the uploaded tensors, and returns the down rows in the same order, so
+ * the CPU reduce and shared expert run unchanged. Only types whose GPU layout
+ * is a plain copy of the GGUF one; returns 0 (CPU path) otherwise. */
+__global__ void picolm_glm5_swiglu_kernel(float *g, const float *u, size_t n, float clamp_v) {
+    for (size_t i = gpuBlockIdx_x * (size_t)gpuBlockDim_x + gpuThreadIdx_x; i < n;
+         i += (size_t)gpuGridDim_x * gpuBlockDim_x) {
+        float gv = g[i], uv = u[i];
+        if (clamp_v > 0.0f) { gv = fminf(gv, clamp_v); uv = fminf(fmaxf(uv, -clamp_v), clamp_v); }
+        g[i] = gv / (1.0f + expf(-gv)) * uv;
+    }
+}
+
+static int moe_plain_type(int qt) {
+    return qt == 0 || qt == 1 || qt == 2 || qt == 8 || qt == 10 || qt == 11 ||
+           qt == 12 || qt == 13 || qt == 14;
+}
+
+extern "C" int
+picolm_gpu_moe_experts(int device, int NE, const int *count, const int *cursor, int pairs,
+                       int D, int FF, const float *xg,
+                       const void *gate_w, const void *up_w, const void *down_w,
+                       int qt_gate, int qt_up, int qt_down,
+                       size_t gate_stride, size_t down_stride, float clamp_v, float *dwn) {
+    if (NE < 1 || pairs < 1 || D < 1 || FF < 1) return 0;
+    if (!moe_plain_type(qt_gate) || !moe_plain_type(qt_up) || !moe_plain_type(qt_down)) return 0;
+    if (!gguf_block_size((gguf_type_t)qt_gate) && qt_gate > 1) return 0;
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    const size_t wbytes = (size_t)NE * (2 * gate_stride + down_stride);
+    const size_t abytes = ((size_t)pairs * (2 * (size_t)D + 2 * (size_t)FF)) * sizeof(float);
+    static uint8_t *wbuf[PICOLM_GPU_MAX_DEVICES]; static size_t wcap[PICOLM_GPU_MAX_DEVICES];
+    static float *abuf[PICOLM_GPU_MAX_DEVICES]; static size_t acap[PICOLM_GPU_MAX_DEVICES];
+    const int di = device < PICOLM_GPU_MAX_DEVICES ? device : 0;
+    if (wcap[di] < wbytes) {
+        if (wbuf[di]) gpuFree(wbuf[di]);
+        wbuf[di] = NULL; wcap[di] = 0;
+        if (!gpu_ok(gpuMalloc((void **)&wbuf[di], wbytes), "moe experts weight buffer")) return 0;
+        wcap[di] = wbytes;
+    }
+    if (acap[di] < abytes) {
+        if (abuf[di]) gpuFree(abuf[di]);
+        abuf[di] = NULL; acap[di] = 0;
+        if (!gpu_ok(gpuMalloc((void **)&abuf[di], abytes), "moe experts act buffer")) return 0;
+        acap[di] = abytes;
+    }
+    uint8_t *dg = wbuf[di], *du = dg + (size_t)NE * gate_stride, *dd = du + (size_t)NE * gate_stride;
+    float *dxg = abuf[di], *dgu = dxg + (size_t)pairs * D, *dgu2 = dgu + (size_t)pairs * FF,
+          *ddwn = dgu2 + (size_t)pairs * FF;
+    if (!gpu_ok(gpuMemcpyAsync(dg, gate_w, (size_t)NE * gate_stride, gpuMemcpyHostToDevice, ctx->stream), "moe H2D gate") ||
+        !gpu_ok(gpuMemcpyAsync(du, up_w, (size_t)NE * gate_stride, gpuMemcpyHostToDevice, ctx->stream), "moe H2D up") ||
+        !gpu_ok(gpuMemcpyAsync(dd, down_w, (size_t)NE * down_stride, gpuMemcpyHostToDevice, ctx->stream), "moe H2D down") ||
+        !gpu_ok(gpuMemcpyAsync(dxg, xg, (size_t)pairs * D * sizeof(float), gpuMemcpyHostToDevice, ctx->stream), "moe H2D x"))
+        return 0;
+    picolm_gpu_tensor_t tg, tu, td;
+    memset(&tg, 0, sizeof tg); tg.qtype = (gguf_type_t)qt_gate; tg.I = D; tg.O = FF; tg.device = device;
+    tg.row_bytes = gate_stride / FF; tg.block_size = gguf_block_size((gguf_type_t)qt_gate);
+    tu = tg; tu.qtype = (gguf_type_t)qt_up; tu.block_size = gguf_block_size((gguf_type_t)qt_up);
+    memset(&td, 0, sizeof td); td.qtype = (gguf_type_t)qt_down; td.I = FF; td.O = D; td.device = device;
+    td.row_bytes = down_stride / D; td.block_size = gguf_block_size((gguf_type_t)qt_down);
+    for (int e = 0; e < NE; e++) {
+        if (!count[e]) continue;
+        const size_t pos = (size_t)cursor[e];
+        tg.weights = dg + (size_t)e * gate_stride;
+        tu.weights = du + (size_t)e * gate_stride;
+        if (!picolm_gpu_matmul_dev(&tg, dgu + pos * FF, dxg + pos * D, count[e], device, 0, 0) ||
+            !picolm_gpu_matmul_dev(&tu, dgu2 + pos * FF, dxg + pos * D, count[e], device, 0, 0)) return 0;
+    }
+    {
+        const size_t n = (size_t)pairs * FF;
+        unsigned nb = (unsigned)((n + 255) / 256); if (nb > 4096) nb = 4096;
+        picolm_glm5_swiglu_kernel<<<nb, 256, 0, ctx->stream>>>(dgu, dgu2, n, clamp_v);
+        if (!gpu_ok(gpuGetLastError(), "moe swiglu")) return 0;
+    }
+    for (int e = 0; e < NE; e++) {
+        if (!count[e]) continue;
+        const size_t pos = (size_t)cursor[e];
+        td.weights = dd + (size_t)e * down_stride;
+        if (!picolm_gpu_matmul_dev(&td, ddwn + pos * D, dgu + pos * FF, count[e], device, 0, 0)) return 0;
+    }
+    if (!gpu_ok(gpuStreamSynchronize(ctx->stream), "moe sync")) return 0;
+    return gpu_ok(gpuMemcpy(dwn, ddwn, (size_t)pairs * D * sizeof(float), gpuMemcpyDeviceToHost), "moe D2H");
+}

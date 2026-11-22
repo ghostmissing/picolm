@@ -633,6 +633,14 @@ int picolm_gpu_glm5_kda_tail(int device, int N, int H, int KD, int CK,
                              const float *dt_bias, const float *a, const float *norm_w,
                              float lower_bound, float eps,
                              float *conv_state, float *state, float *out);
+/* GLM-5 routed experts of a prefill chunk on the GPU (expert weights streamed
+ * from host RAM per call): rows of xg sorted by expert (cursor/count), out
+ * dwn in the same order. 0 if a type is unsupported (caller uses the CPU). */
+int picolm_gpu_moe_experts(int device, int NE, const int *count, const int *cursor, int pairs,
+                           int D, int FF, const float *xg,
+                           const void *gate_w, const void *up_w, const void *down_w,
+                           int qt_gate, int qt_up, int qt_down,
+                           size_t gate_stride, size_t down_stride, float clamp_v, float *dwn);
 int picolm_gpu_rmsnorm_dev(float *out, const float *x, const float *weight,
                             int dim, float eps, int device);
 /* Host-side rmsnorm: takes host pointers, does H2D/D2H/sync. */
