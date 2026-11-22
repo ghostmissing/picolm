@@ -1619,9 +1619,26 @@ kquant_hmma_dev(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t *t, float *y_dev,
             y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
     } else {
         gpu_dispatch_print("matmul_kq_hmma_dev");
-        picolm_kq_q8_K_matmul_hmma_launch((int)t->qtype, grid, ctx->stream,
-            y_dev, ctx->q8_xq, ctx->q8_xd, ctx->q8_k_bsums, t->weights,
-            S, I, O, (int)t->row_bytes, ys);
+        /* Short chunk: split I as for Q8MM_HMMA (>= 4 super-blocks each). */
+        int splits = 1;
+        if (grid.x * grid.y < 320) {
+            splits = (int)((320 + grid.x * grid.y - 1) / (grid.x * grid.y));
+            if (splits > n_super / 4) splits = n_super / 4;
+            if (splits < 1) splits = 1;
+        }
+        if (splits > 1 && reserve(&ctx->splitk, &ctx->splitk_cap, (size_t)splits * S * O * sizeof(float))) {
+            grid.z = (unsigned)splits;
+            picolm_kq_q8_K_matmul_hmma_launch((int)t->qtype, grid, ctx->stream,
+                ctx->splitk, ctx->q8_xq, ctx->q8_xd, ctx->q8_k_bsums, t->weights,
+                S, I, O, (int)t->row_bytes, O);
+            const size_t n = (size_t)S * O;
+            picolm_splitk_reduce<<<(unsigned)((n + 255) / 256 < 1024 ? (n + 255) / 256 : 1024), 256, 0, ctx->stream>>>(
+                y_dev, ctx->splitk, splits, S, O, ys);
+        } else {
+            picolm_kq_q8_K_matmul_hmma_launch((int)t->qtype, grid, ctx->stream,
+                y_dev, ctx->q8_xq, ctx->q8_xd, ctx->q8_k_bsums, t->weights,
+                S, I, O, (int)t->row_bytes, ys);
+        }
     }
     return gpu_ok(gpuGetLastError(), "k-quant matmul hmma (dev)");
 }

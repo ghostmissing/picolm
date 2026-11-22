@@ -1876,6 +1876,13 @@ picolm_kq_q8_K_matmul_hmma(float *y, const int8_t *xq, const float *xd, const in
     int o0 = gpuBlockIdx_x * I6H_TO, s0 = gpuBlockIdx_y * I6H_TS;
     int ys = y_stride > 0 ? y_stride : O;
     int n_super = I / 256;
+    /* gridDim.z > 1: split-K over super-blocks, partials at y + z * S * ys
+     * (picolm_splitk_reduce), as in picolm_q8_q8_matmul_hmma. */
+    const int per = (n_super + (int)gpuGridDim_z - 1) / (int)gpuGridDim_z;
+    const int sb_lo = (int)gpuBlockIdx_z * per;
+    const int sb_hi = sb_lo + per < n_super ? sb_lo + per : n_super;
+    y += (size_t)gpuBlockIdx_z * (size_t)S * ys;
+    const int ts_used = S - s0 >= I6H_TS ? I6H_TS : (S - s0 + 31) / 32 * 32;
 
     int qp = (lane >> 2) & 3, r = (lane & 3) + 4 * (lane >> 4);
     int wr = (warp % I6H_WR) * 16 * I6H_WG, wc = (warp / I6H_WR) * 16 * I6H_WH;
@@ -1896,7 +1903,7 @@ picolm_kq_q8_K_matmul_hmma(float *y, const int8_t *xq, const float *xd, const in
         for (int h = 0; h < I6H_WH; h++)
             for (int j = 0; j < 8; j++) sum[g][h][j] = acc[g][h][j] = 0.0f;
 
-    for (int k0 = 0; k0 < I; k0 += 64) {
+    for (int k0 = 256 * sb_lo; k0 < 256 * sb_hi; k0 += 64) {
         const int sb = k0 / 256, part = (k0 / 64) & 3;
         gpuSyncthreads();   /* previous stage consumed */
         /* Weights: one thread per (row, 16-value group g16 = 4*part + gg). */
@@ -1957,7 +1964,7 @@ picolm_kq_q8_K_matmul_hmma(float *y, const int8_t *xq, const float *xd, const in
             }
         }
         /* Activations: one thread per token, 64 int8 (+ scale, bsum32 at part 0). */
-        for (int ls = tid; ls < I6H_TS; ls += I6H_THREADS) {
+        for (int ls = tid; ls < ts_used; ls += I6H_THREADS) {   /* tokens a working warp reads */
             const int s = s0 + ls;
             uint32_t q[16];
             if (s < S) {
@@ -1981,6 +1988,7 @@ picolm_kq_q8_K_matmul_hmma(float *y, const int8_t *xq, const float *xd, const in
         }
         gpuSyncthreads();
 
+        if (s0 + wc < S)   /* all-padding warps of a short chunk skip the mma */
         for (int gg = 0; gg < 4; gg++) {
             float c16[I6H_WG][I6H_WH][8];
             for (int g = 0; g < I6H_WG; g++)

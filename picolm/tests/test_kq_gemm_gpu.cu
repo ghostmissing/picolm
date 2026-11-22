@@ -50,6 +50,18 @@ static int run(int qt, int S, int I, int O) {
     for (int r = 0; r < 3; r++) picolm_kq_q8_K_matmul_hmma_launch(qt, g, 0, dy, dq, dd, db, dw, S, I, O, rb, O);
     cudaEventRecord(b); cudaEventSynchronize(b); float ms; cudaEventElapsedTime(&ms, a, b); ms /= 3;
     float *hy = (float *)malloc((size_t)S * O * 4); cudaMemcpy(hy, dy, (size_t)S * O * 4, cudaMemcpyDeviceToHost);
+    /* split-K path (as kquant_hmma_dev takes for short chunks): 4 splits,
+     * partials reduced into dy2; must match the single launch closely. */
+    float *dy2 = NULL, *dpart = NULL, *hy2 = (float *)malloc((size_t)S * O * 4);
+    int splits = ns >= 4 ? 4 : 1;
+    cudaMalloc(&dy2, (size_t)S * O * 4); cudaMalloc(&dpart, (size_t)splits * S * O * 4);
+    dim3 gz = g; gz.z = splits;
+    picolm_kq_q8_K_matmul_hmma_launch(qt, gz, 0, dpart, dq, dd, db, dw, S, I, O, rb, O);
+    picolm_splitk_reduce<<<256, 256>>>(dy2, dpart, splits, S, O, O);
+    cudaMemcpy(hy2, dy2, (size_t)S * O * 4, cudaMemcpyDeviceToHost);
+    double sd = 0, smag = 0;
+    for (size_t i = 0; i < (size_t)S * O; i++) { sd = fmax(sd, fabs(hy2[i] - hy[i])); smag = fmax(smag, fabs(hy[i])); }
+    cudaFree(dy2); cudaFree(dpart); free(hy2);
     cudaError_t err = cudaGetLastError();
     double mx = 0, *wr = (double *)malloc(256 * 8); int n = 0;
     for (int o = 0; o < O; o += (O > 300 ? 97 : 1))
@@ -59,7 +71,8 @@ static int run(int qt, int S, int I, int O) {
                 for (int i = 0; i < 256; i++) { double t = wr[i] * xq[(size_t)s * I + k * 256 + i] * xd[(size_t)s * ns + k]; ref += t; mag += fabs(t); } }
             double e = fabs(hy[(size_t)s * O + o] - ref) / mag; if (!(e <= mx)) mx = e; n++;
         }
-    int fail = err != cudaSuccess || !(mx < 1e-6);
+    int fail = err != cudaSuccess || !(mx < 1e-6) || !(sd <= 1e-5 * smag);
+    if (!(sd <= 1e-5 * smag)) printf("split-K (%d) differs: %.2e of max |y|\n", splits, sd / smag);
     printf("%s S=%-4d I=%-6d O=%-5d %7.2f ms %5.1f TOPS  max_err %.1e (%d) %s\n", qt == 14 ? "Q6_K" : qt == 13 ? "Q5_K" : "Q4_K", S, I, O, ms, 2.0 * S * I * O / ms / 1e9, mx, n,
            err != cudaSuccess ? cudaGetErrorString(err) : fail ? "FAIL" : "ok");
     cudaFree(dw); cudaFree(dq); cudaFree(dd); cudaFree(db); cudaFree(dy); free(w); free(xq); free(xd); free(bs); free(hy); free(wr);
@@ -70,6 +83,6 @@ int main() {
     cudaGetDeviceProperties(&prop, 0);
     if (!(prop.major == 7 && prop.minor == 0)) { printf("not a Volta GPU: skipped\n"); return 0; }
     int f = 0;
-    for (int qt = 12; qt <= 14; qt++) { f |= run(qt, 5, 256, 7); f |= run(qt, 37, 1024, 129); f |= run(qt, 1900, 5120, 4096); }
+    for (int qt = 12; qt <= 14; qt++) { f |= run(qt, 5, 256, 7); f |= run(qt, 37, 1024, 129); f |= run(qt, 1900, 5120, 4096); f |= run(qt, 27, 5120, 1024); }
     printf(f ? "FAILED\n" : "all ok\n"); return f;
 }
