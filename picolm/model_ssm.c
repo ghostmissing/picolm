@@ -5404,11 +5404,20 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
      * offload n_gpu_layers == c->n_layers and this is unchanged. */
     int n_gpu_layers = gw->n_gpu_layers;
     if (n_gpu_layers <= 0 || n_gpu_layers > c->n_layers) n_gpu_layers = c->n_layers;
+    /* PICOLM_GPU_LAYER_CHECK=1: at pos 0 (a one-token prompt, both paths
+     * start from empty state), rerun every layer on the CPU from the GPU's
+     * input and print the relative difference of the layer output. Debugging
+     * aid; the CPU state it leaves behind is not consistent afterwards. */
+    static int lchk = -1;
+    if (lchk < 0) lchk = getenv("PICOLM_GPU_LAYER_CHECK") ? 1 : 0;
+    const int lck = lchk == 1 && pos == 0;
+    float *lck_in = lck ? (float *)malloc((size_t)dim * 2 * sizeof(float)) : NULL;
     for (int l = 0; l < n_gpu_layers; l++) {
         if (l > 0 && (l % batch_flush_interval) == 0) {
             picolm_gpu_batch_end(gpu_dev);
             picolm_gpu_batch_begin(gpu_dev);
         }
+        if (lck_in) { picolm_gpu_sync(gpu_dev); picolm_gpu_memcpy(lck_in, pipe_x, (size_t)dim * sizeof(float), -1, gpu_dev); }
         picolm_gpu_set_dbg_layer(l);
         layer_weights_t *lw = &w->layers[l];
         gl = &gw->layers[l];
@@ -5818,6 +5827,23 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
             /* P. Residual add: pipe_x += pipe_xb */
             picolm_gpu_residual_add(pipe_x, pipe_x, pipe_xb, 1, dim, q_pipeline_dim, gpu_dev);
         } /* end if (!did_cpu_ssm) */
+        if (lck_in) {
+            float *g = lck_in + dim;
+            picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(g, pipe_x, (size_t)dim * sizeof(float), -1, gpu_dev);
+            memcpy(s->x, lck_in, (size_t)dim * sizeof(float));
+            tensor_set_gpu_tensor(NULL, 0);
+            model_forward_range(m, token, pos, l, l + 1, 0, 0);
+            double md = 0, mr = 0, mdl = 0, mrl = 0;
+            for (int i = 0; i < dim; i++) {
+                const double d = fabs((double)g[i] - s->x[i]), r = fabs((double)s->x[i]);
+                const double dl = fabs(((double)g[i] - lck_in[i]) - ((double)s->x[i] - lck_in[i]));
+                const double rl = fabs((double)s->x[i] - lck_in[i]);
+                if (d > md) md = d; if (r > mr) mr = r; if (dl > mdl) mdl = dl; if (rl > mrl) mrl = rl;
+            }
+            fprintf(stderr, "[layer chk] l%02d %s out rel %.2e  delta rel %.2e\n", l,
+                    lw->is_attn_layer ? "attn" : "ssm ", mr ? md / mr : md, mrl ? mdl / mrl : mdl);
+        }
 
 #ifdef PICOLM_VIZ
         /* Residual stream after this layer, for the VNC visualization.
