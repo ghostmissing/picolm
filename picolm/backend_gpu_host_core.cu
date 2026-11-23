@@ -3056,7 +3056,8 @@ picolm_gpu_moe_experts(int device, int NE, const int *count, const int *cursor, 
 /* G independent decode products back to back: t holds G*Og rows of I (a 3-D
  * per-head weight such as GLM-5's attn_k_b uploaded whole), group g multiplies
  * rows [g*Og, (g+1)*Og) by x[g*I..] into y[g*Og..]. Q8_0 is one quantise and
- * one grouped GEMV launch; other plain-layout types run per group on views.
+ * one grouped GEMV launch, K-quants one Q8_K quantise and one grouped GEMV;
+ * other plain-layout types run per group on views.
  * Device pointers, no sync. 0 if the type is not a plain copy. */
 /* S tokens of the same: token rows of x every x_stride floats (group g at
  * g*I within the row), of y every y_stride (group g at g*Og). */
@@ -3091,6 +3092,40 @@ picolm_gpu_matmul_dev_grouped(picolm_gpu_tensor_t *t, float *y_dev, const float 
         picolm_q8_0_gemv<<<dim3((unsigned)Og, (unsigned)G), 32 * GEMV_WARPS, 0, ctx->stream>>>(
             y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, I, Og, (int)t->row_bytes, Og);
         return gpu_ok(gpuGetLastError(), "grouped q8 gemv");
+    }
+    /* K-quants (MLA k_b/v_b in a Q4_K_M): one Q8_K quantise of all G inputs
+     * (I is a multiple of 256, so the superblocks fall per group) and one
+     * GEMV launch over all heads, instead of 2 * G launches. */
+    const int kq = t->qtype == GGUF_TYPE_Q4_K ? 4 : t->qtype == GGUF_TYPE_Q5_K ? 5 :
+                   t->qtype == GGUF_TYPE_Q6_K ? 6 : (int)t->qtype == 10 ? 2 : (int)t->qtype == 11 ? 3 : 0;
+    static int kq_off = -1;
+    if (kq_off < 0) kq_off = getenv("PICOLM_GPU_NO_KQ_GROUP") ? 1 : 0;   /* A/B: per-head loop */
+    if (kq && !kq_off && I % 256 == 0 && !picolm_gpu_no_gemv()) {
+        const int n_super = G * I / 256;
+        const size_t bsums_bytes = (size_t)n_super * 16 * sizeof(int16_t);
+        if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, (size_t)n_super * 256) ||
+            !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, (size_t)n_super * sizeof(float))) return 0;
+        if (ctx->q8_k_bsums_cap < bsums_bytes) {
+            if (ctx->q8_k_bsums) gpuFree(ctx->q8_k_bsums);
+            if (!gpu_ok(gpuMalloc(&ctx->q8_k_bsums, bsums_bytes), "q8_k bsums alloc")) {
+                ctx->q8_k_bsums = NULL; ctx->q8_k_bsums_cap = 0; return 0;
+            }
+            ctx->q8_k_bsums_cap = bsums_bytes;
+        }
+        picolm_quantize_q8_K<<<dim3((unsigned)n_super, 1), 256, 0, ctx->stream>>>(
+            ctx->q8_xd, ctx->q8_xq, ctx->q8_k_bsums, x_dev, G * I, 1);
+        if (!gpu_ok(gpuGetLastError(), "grouped q8_K quantize")) return 0;
+        const dim3 grid((unsigned)Og, (unsigned)G);
+        const int rb = (int)t->row_bytes;
+        int16_t *bs = (int16_t *)ctx->q8_k_bsums;
+        switch (kq) {
+        case 2: picolm_q2_K_gemv<<<grid, 32 * GEMV_WARPS, 0, ctx->stream>>>(y_dev, ctx->q8_xq, ctx->q8_xd, bs, t->weights, I, Og, rb, Og); break;
+        case 3: picolm_q3_K_gemv<<<grid, 32 * GEMV_WARPS, 0, ctx->stream>>>(y_dev, ctx->q8_xq, ctx->q8_xd, bs, t->weights, I, Og, rb, Og); break;
+        case 4: picolm_q4_K_gemv<<<grid, 32 * GEMV_WARPS, 0, ctx->stream>>>(y_dev, ctx->q8_xq, ctx->q8_xd, bs, t->weights, I, Og, rb, Og); break;
+        case 5: picolm_q5_K_gemv<<<grid, 32 * GEMV_WARPS, 0, ctx->stream>>>(y_dev, ctx->q8_xq, ctx->q8_xd, bs, t->weights, I, Og, rb, Og); break;
+        default: picolm_q6_K_gemv<<<grid, 32 * GEMV_WARPS, 0, ctx->stream>>>(y_dev, ctx->q8_xq, ctx->q8_xd, bs, t->weights, I, Og, rb, Og); break;
+        }
+        return gpu_ok(gpuGetLastError(), "grouped K-quant gemv");
     }
     picolm_gpu_tensor_t v = *t;
     v.O = Og;

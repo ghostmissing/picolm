@@ -849,6 +849,14 @@ __device__ static inline void gemv_q5k_scale_min(const uint8_t *packed, int sub,
     out[1] = sc[8 + sub];
 }
 
+/* gridDim.y > 1: independent K-quant GEMVs laid out back to back (a 3-D
+ * per-head weight, picolm_gpu_matmul_dev_grouped): blockIdx.y picks the
+ * group's O rows, its I-long slice of the Q8_K input and its O outputs. */
+#define KQ_GROUP_OFFSETS() do { const int g_ = (int)gpuBlockIdx_y; \
+    weights = (const uint8_t *)weights + (size_t)g_ * O * row_bytes; \
+    xq += (size_t)g_ * I; xd += (size_t)g_ * (I / 256); xbsums += (size_t)g_ * (I / 256) * 16; \
+    y += (size_t)g_ * O; } while (0)
+
 __global__ void
 picolm_q5_K_gemv(float *y,
                  const int8_t *xq, const float *xd, const int16_t *xbsums,
@@ -859,6 +867,7 @@ picolm_q5_K_gemv(float *y,
     const int tid  = warp * 32 + lane;
     const int o    = (int)gpuBlockIdx_x;
     if (o >= O) return;
+    KQ_GROUP_OFFSETS();
     int ys = y_stride > 0 ? y_stride : O;
 
     const int n_super = I / 256;
@@ -988,6 +997,7 @@ picolm_q6_K_gemv(float *y,
     const int tid  = warp * 32 + lane;
     const int o    = (int)gpuBlockIdx_x;
     if (o >= O) return;
+    KQ_GROUP_OFFSETS();
     int ys = y_stride > 0 ? y_stride : O;
 
     const int n_super = I / 256;
@@ -1095,6 +1105,7 @@ picolm_q4_K_gemv(float *y,
     const int tid  = warp * 32 + lane;
     const int o    = (int)gpuBlockIdx_x;
     if (o >= O) return;
+    KQ_GROUP_OFFSETS();
     int ys = y_stride > 0 ? y_stride : O;
 
     const int n_super = I / 256;
@@ -1210,6 +1221,7 @@ picolm_q3_K_gemv(float *y,
     const int tid  = warp * 32 + lane;
     const int o    = (int)gpuBlockIdx_x;
     if (o >= O) return;
+    KQ_GROUP_OFFSETS();
 
     const int n_super = I / 256;
     const uint8_t *wrow = (const uint8_t *)weights + (size_t)o * row_bytes;
@@ -1300,6 +1312,7 @@ picolm_q2_K_gemv(float *y,
     const int tid  = warp * 32 + lane;
     const int o    = (int)gpuBlockIdx_x;
     if (o >= O) return;
+    KQ_GROUP_OFFSETS();
 
     const int n_super = I / 256;
     const uint8_t *wrow = (const uint8_t *)weights + (size_t)o * row_bytes;
@@ -1399,6 +1412,7 @@ picolm_iq6_K_gemv(float *y,
     const int tid  = warp * 32 + lane;
     const int o    = (int)gpuBlockIdx_x;
     if (o >= O) return;
+    KQ_GROUP_OFFSETS();
 
     const int n_super = I / 256;
     const uint8_t *wrow = (const uint8_t *)weights + (size_t)o * row_bytes;
