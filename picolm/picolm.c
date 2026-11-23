@@ -2352,6 +2352,7 @@ int main(int argc, char **argv) {
            add_bos=false, Qwen3.6 GGUFs may set it to 0 or 1. The server path
            doesn't prepend BOS for Qwen models, so CLI should match. */
         /* GPT-2 models: don't add BOS (the  token is a separator, not BOS) */
+        if (getenv("PICOLM_NO_BOS")) model.tok_add_bos = 0;   /* TMP debug */
         if (model.tok_add_bos && tokenizer.bos_id != 11 && !model.config.is_gpt2) {
             n_prompt = qwen_tokenize_encode(&qwen_enc, prompt, prompt_tokens + 1, max_prompt_tokens - 1);
             prompt_tokens[0] = (int)tokenizer.bos_id;
