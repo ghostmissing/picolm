@@ -3724,7 +3724,7 @@ static struct {
 /* Weight types picolm_gpu_matmul_dev() multiplies (its generic kernel's list). */
 static int g5d_type_ok(gguf_type_t t) {
     switch ((int)t) {
-    case 0: case 1: case 30: case 2: case 3: case 8: case 10: case 11: case 12: case 13: case 14:
+    case 0: case 1: case 30: case 2: case 3: case 6: case 7: case 8: case 10: case 11: case 12: case 13: case 14:
     case 20: case 41: case 42: case 133: case 141: return 1;
     default: return 0;
     }
@@ -4028,6 +4028,7 @@ static float *glm5_gpu_forward(model_t *m, int token, int pos) {
     if (chk < 0) { const char *ce = getenv("PICOLM_GLM5_GPU_CHECK"); chk = ce && atoi(ce) ? 1 : 0; }
     const int ck = chk == 1;
     if (ck) chk = 2;
+    if (ck && !glm5_gpu_kda_download(m)) goto fail;   /* the CPU stages start from the device state */
     const int SD = S * D;
     float *hin = ck ? (float *)malloc((size_t)SD * 2 * sizeof(float) + (size_t)(D + 64) * sizeof(float)) : NULL;
     float *cref = hin ? hin + SD : NULL, *pref = hin ? hin + SD + D : NULL;

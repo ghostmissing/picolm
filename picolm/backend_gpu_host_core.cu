@@ -539,6 +539,8 @@ static int gguf_block_size(gguf_type_t qtype) {
     case 41: return 18;   /* Q1_0: 18 bytes per 128 values */
     case 42: return 34;   /* Q2_0: 34 bytes per 128 values */
     case 133: return 26;  /* Q6_0: 26 bytes per 32 values (F16 d + 8 qh + 16 qs) */
+    case 6:  return 22;   /* Q5_0: 22 bytes per 32 values (F16 d + 4 qh + 16 qs) */
+    case 7:  return 24;   /* Q5_1: 24 bytes per 32 values (F16 d, m + 4 qh + 16 qs) */
     /* Q8_0_R8 is 8 rows interleaved into 272 bytes, i.e. 34 bytes per row per
      * 32 values -- the same per-row density as Q8_0. It has no native GPU
      * kernel; picolm_gpu_tensor_upload repacks it to Q8_0 on the way in (see

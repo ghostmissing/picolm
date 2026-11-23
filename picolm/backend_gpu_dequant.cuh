@@ -46,6 +46,27 @@ __device__ static inline float dequant_q4_1(const void *blk, int i) {
     return (float)v * d + m;
 }
 
+/* block_q5_0: 22 bytes = 2B scale(FP16) + 4B qh (bit 4 of each value) + 16B qs.
+ * Value i: low nibble of qs[i] (i < 16) or high nibble of qs[i-16], bit 4 =
+ * bit i of qh; dequant = (q - 16) * d. block_q5_1 (24 bytes) adds an FP16 min
+ * after d and dequantizes to q * d + m. */
+__device__ static inline int q5_value(const uint8_t *qh4, const uint8_t *qs, int i) {
+    const uint32_t qh = (uint32_t)qh4[0] | ((uint32_t)qh4[1] << 8) | ((uint32_t)qh4[2] << 16) | ((uint32_t)qh4[3] << 24);
+    const int nib = i < 16 ? (qs[i] & 0xF) : (qs[i - 16] >> 4);
+    return nib | (int)(((qh >> i) & 1u) << 4);
+}
+__device__ static inline float dequant_q5_0(const void *blk, int i) {
+    const uint8_t *b = (const uint8_t *)blk;
+    const float d = gpu_fp16_to_fp32((uint16_t)(b[0] | ((uint16_t)b[1] << 8)));
+    return (float)(q5_value(b + 2, b + 6, i) - 16) * d;
+}
+__device__ static inline float dequant_q5_1(const void *blk, int i) {
+    const uint8_t *b = (const uint8_t *)blk;
+    const float d = gpu_fp16_to_fp32((uint16_t)(b[0] | ((uint16_t)b[1] << 8)));
+    const float m = gpu_fp16_to_fp32((uint16_t)(b[2] | ((uint16_t)b[3] << 8)));
+    return (float)q5_value(b + 4, b + 8, i) * d + m;
+}
+
 /* block_q8_0: 34 bytes = 2B scale(FP16) + 32B qs (32 values)
  * dequant(i) = qs[i] * d */
 __device__ static inline float dequant_q8_0(const void *blk, int i) {

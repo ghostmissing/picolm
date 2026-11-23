@@ -26,6 +26,8 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
         case 42:             bytes_per_block = 34; break;      /* Q2_0 */
         case GGUF_TYPE_IQ4_NL: bytes_per_block = GPU_BLOCK_Q4_0_SIZE; break;  /* IQ4_NL: 18 */
         case 133:              bytes_per_block = 26; break;                      /* Q6_0: 26 */
+        case 6:                bytes_per_block = 22; break;                      /* Q5_0: 22 */
+        case 7:                bytes_per_block = 24; break;                      /* Q5_1: 24 */
         default: bytes_per_block = 18; break;
     }
     int o = gpuBlockIdx_x;
@@ -226,6 +228,18 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
                     int i = bi * 128 + j;
                     sum += x[rs*s+i] * dequant_q2_0(blk, j);
                 }
+            }
+        }
+        break;
+
+    case 6: /* GGUF_TYPE_Q5_0 (llama-quantize's fallback for rows not a multiple of 256) */
+    case 7: /* GGUF_TYPE_Q5_1 */
+        {
+            int n_blocks = I / 32;
+            for (int bi = gpuThreadIdx_x; bi < n_blocks; bi += gpuBlockDim_x) {
+                const void *blk = wrow + (size_t)bi * bytes_per_block;
+                for (int j = 0; j < 32; j++)
+                    sum += x[rs*s + bi * 32 + j] * (qtype == 6 ? dequant_q5_0(blk, j) : dequant_q5_1(blk, j));
             }
         }
         break;
