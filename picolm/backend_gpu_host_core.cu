@@ -232,6 +232,25 @@ static int q8mm_launch(q8mm_kind_t kind, gpu_device_ctx_t *ctx,
     case Q8MM_HMMA: {
         gpu_dispatch_print("matmul_hmma");
         dim3 grid((unsigned)((O + 63) / 64), (unsigned)((S + 127) / 128));
+        /* A short chunk (one 128-token tile) leaves O/64 blocks, too few
+         * for the card: split I across ~320 blocks, >= 16 Q8_0 blocks each.
+         * Cydonia-24B, 27 tokens: the matmuls ran at ~110 GB/s. */
+        int splits = 1;
+        const unsigned nb = grid.x * grid.y;
+        if (nb < 320) {
+            splits = (int)((320 + nb - 1) / nb);
+            if (splits > I / 32 / 16) splits = I / 32 / 16;
+            if (splits < 1) splits = 1;
+        }
+        if (splits > 1 && reserve(&ctx->splitk, &ctx->splitk_cap, (size_t)splits * S * O * sizeof(float))) {
+            grid.z = (unsigned)splits;
+            picolm_q8_q8_matmul_hmma<<<grid, 128, 0, ctx->stream>>>(
+                ctx->splitk, xq, xd, t->weights, S, I, O, row_bytes, O);
+            const size_t n = (size_t)S * O;
+            picolm_splitk_reduce<<<(unsigned)((n + 255) / 256 < 1024 ? (n + 255) / 256 : 1024), 256, 0, ctx->stream>>>(
+                y, ctx->splitk, splits, S, O, ys);
+            break;
+        }
         picolm_q8_q8_matmul_hmma<<<grid, 128, 0, ctx->stream>>>(
             y, xq, xd, t->weights, S, I, O, row_bytes, ys);
         break;
@@ -1573,6 +1592,59 @@ picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, int d
 /* Q8_K activation scratch + one GEMV launch, shared by the Q5_K and Q6_K
  * decode paths. Returns 1 on success, 0 to let the caller fall back to the
  * IMMA tile paths (which still use Q8_0 activations). */
+/* K-quant / IQ6_K prefill on Volta tensor cores: Q8_K-quantise the S
+ * activation rows (same quantiser as the GEMVs), then
+ * picolm_iq6_k_q8_K_matmul_hmma or picolm_kq_q8_K_matmul_hmma. */
+static int
+kquant_hmma_dev(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t *t, float *y_dev,
+               const float *x_dev, int S, int I, int O, int ys) {
+    const int n_super = I / 256;
+    size_t qs_bytes    = (size_t)S * I;
+    size_t d_bytes     = (size_t)S * n_super * sizeof(float);
+    size_t bsums_bytes = (size_t)S * n_super * 16 * sizeof(int16_t);
+    if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, qs_bytes) ||
+        !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, d_bytes)) return 0;
+    if (ctx->q8_k_bsums_cap < bsums_bytes) {
+        if (ctx->q8_k_bsums) gpuFree(ctx->q8_k_bsums);
+        if (!gpu_ok(gpuMalloc(&ctx->q8_k_bsums, bsums_bytes), "q8_k bsums alloc")) {
+            ctx->q8_k_bsums = NULL; ctx->q8_k_bsums_cap = 0; return 0;
+        }
+        ctx->q8_k_bsums_cap = bsums_bytes;
+    }
+    picolm_quantize_q8_K<<<dim3((unsigned)n_super, (unsigned)S), 256, 0, ctx->stream>>>(
+        ctx->q8_xd, ctx->q8_xq, ctx->q8_k_bsums, x_dev, I, S);
+    if (!gpu_ok(gpuGetLastError(), "q8_K quantize (k-quant hmma)")) return 0;
+    dim3 grid((unsigned)((O + 63) / 64), (unsigned)((S + 127) / 128));
+    if (t->qtype == GGUF_TYPE_IQ6_K) {
+        gpu_dispatch_print("matmul_iq6_hmma_dev");
+        picolm_iq6_k_q8_K_matmul_hmma<<<grid, 128, 0, ctx->stream>>>(
+            y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
+    } else {
+        gpu_dispatch_print("matmul_kq_hmma_dev");
+        /* Short chunk: split I as for Q8MM_HMMA (>= 4 super-blocks each). */
+        int splits = 1;
+        if (grid.x * grid.y < 320) {
+            splits = (int)((320 + grid.x * grid.y - 1) / (grid.x * grid.y));
+            if (splits > n_super / 4) splits = n_super / 4;
+            if (splits < 1) splits = 1;
+        }
+        if (splits > 1 && reserve(&ctx->splitk, &ctx->splitk_cap, (size_t)splits * S * O * sizeof(float))) {
+            grid.z = (unsigned)splits;
+            picolm_kq_q8_K_matmul_hmma_launch((int)t->qtype, grid, ctx->stream,
+                ctx->splitk, ctx->q8_xq, ctx->q8_xd, ctx->q8_k_bsums, t->weights,
+                S, I, O, (int)t->row_bytes, O);
+            const size_t n = (size_t)S * O;
+            picolm_splitk_reduce<<<(unsigned)((n + 255) / 256 < 1024 ? (n + 255) / 256 : 1024), 256, 0, ctx->stream>>>(
+                y_dev, ctx->splitk, splits, S, O, ys);
+        } else {
+            picolm_kq_q8_K_matmul_hmma_launch((int)t->qtype, grid, ctx->stream,
+                y_dev, ctx->q8_xq, ctx->q8_xd, ctx->q8_k_bsums, t->weights,
+                S, I, O, (int)t->row_bytes, ys);
+        }
+    }
+    return gpu_ok(gpuGetLastError(), "k-quant matmul hmma (dev)");
+}
+
 static int
 kquant_gemv_dev(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t *t, float *y_dev,
                 const float *x_dev, int I, int O, int ys, int x_stride,
@@ -1924,12 +1996,23 @@ matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
          * dequant case could never be reached.) */
         if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 141, 1))
             return 1;
+        /* S > 1 on Volta: tensor cores. PICOLM_NO_Q8_HMMA=1 keeps the dequant path. */
+        if (S > 1 && ctx->has_hmma && picolm_gpu_q8_hmma() && (x_stride <= 0 || x_stride == I) &&
+            kquant_hmma_dev(ctx, t, y_dev, x_dev, S, I, O, ys))
+            return 1;
     }
 
     /* K-quant decode on the GEMVs on any GPU; the has_imma branches below
      * used to be the only way in (see the host path). */
     if (S == 1 && O >= 8 && I % 256 == 0 && kquant_which(t->qtype) && !picolm_gpu_no_gemv() &&
         kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, kquant_which(t->qtype), 1))
+        return 1;
+    /* K-quant prefill (S > 1) on Volta tensor cores. PICOLM_NO_Q8_HMMA=1
+     * keeps the paths below. */
+    if (S > 1 && ctx->has_hmma && picolm_gpu_q8_hmma() && (x_stride <= 0 || x_stride == I) &&
+        O >= 8 && I % 256 == 0 &&
+        (t->qtype == GGUF_TYPE_Q4_K || t->qtype == GGUF_TYPE_Q5_K || t->qtype == GGUF_TYPE_Q6_K) &&
+        kquant_hmma_dev(ctx, t, y_dev, x_dev, S, I, O, ys))
         return 1;
 
     if (t->qtype == GGUF_TYPE_Q2_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {

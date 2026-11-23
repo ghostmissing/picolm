@@ -1629,6 +1629,15 @@ picolm_q8_q8_matmul_hmma(float *y, const int8_t *xq, const float *xd,
     int o0 = gpuBlockIdx_x * Q8H_TO, s0 = gpuBlockIdx_y * Q8H_TS;
     int ys = y_stride > 0 ? y_stride : O;
     int n_blocks = I / 32;
+    /* gridDim.z > 1: split-K. Block z covers Q8_0 blocks [b_lo, b_hi) and
+     * writes its partial sums at y + z * S * ys; picolm_splitk_reduce adds
+     * them up. A short chunk has one token tile, so only O/64 blocks -- 16
+     * for a 1024-row K/V -- each walking all of I serially. */
+    const int per = ((n_blocks + (int)gpuGridDim_z - 1) / (int)gpuGridDim_z + Q8H_KB - 1) / Q8H_KB * Q8H_KB;
+    const int b_lo = (int)gpuBlockIdx_z * per;
+    const int b_hi = b_lo + per < n_blocks ? b_lo + per : n_blocks;
+    y += (size_t)gpuBlockIdx_z * (size_t)S * ys;
+    const int ts_used = S - s0 >= Q8H_TS ? Q8H_TS : (S - s0 + 31) / 32 * 32;
 
     int qp = (lane >> 2) & 3;
     int r = (lane & 3) + 4 * (lane >> 4);                 /* A row / B col */
@@ -1649,15 +1658,17 @@ picolm_q8_q8_matmul_hmma(float *y, const int8_t *xq, const float *xd,
         for (int h = 0; h < Q8H_WH; h++)
             for (int j = 0; j < 8; j++) sum[g][h][j] = 0.0f;
 
-    for (int b0 = 0; b0 < n_blocks; b0 += Q8H_KB) {
-        /* Stage: one thread per (row or token, block); 2 x 256 units. */
-        for (int it = tid; it < (Q8H_TO + Q8H_TS) * Q8H_KB; it += Q8H_THREADS) {
+    for (int b0 = b_lo; b0 < b_hi; b0 += Q8H_KB) {
+        /* Stage: one thread per (row or token, block); 2 x 256 units. Only
+         * the tokens a working warp reads (up to the next 32 past S): the
+         * rest of a short chunk's tile is never touched. */
+        for (int it = tid; it < (Q8H_TO + ts_used) * Q8H_KB; it += Q8H_THREADS) {
             int kb = it % Q8H_KB, rr = it / Q8H_KB, bi = b0 + kb;
             uint32_t q[8];
             float d = 0.0f;
             if (rr < Q8H_TO) {
                 int o = o0 + rr;
-                if (o < O && bi < n_blocks) {
+                if (o < O && bi < b_hi) {
                     const uint16_t *p = (const uint16_t *)((const uint8_t *)weights
                         + (size_t)o * row_bytes + (size_t)bi * GPU_BLOCK_Q8_0_SIZE);
                     d = gpu_fp16_to_fp32(p[0]);
@@ -1667,7 +1678,7 @@ picolm_q8_q8_matmul_hmma(float *y, const int8_t *xq, const float *xd,
                 for (int i = 0; i < 8; i++) q8h_cvt4((__half2 *)&w_sh[rr][kb * 32 + 4 * i], q[i]);
             } else {
                 int ls = rr - Q8H_TO, s = s0 + ls;
-                if (s < S && bi < n_blocks) {
+                if (s < S && bi < b_hi) {
                     const int4 *p = (const int4 *)(xq + (size_t)s * I + (size_t)bi * 32);
                     ((int4 *)q)[0] = p[0]; ((int4 *)q)[1] = p[1];
                     d = xd[(size_t)s * n_blocks + bi];
@@ -1678,6 +1689,10 @@ picolm_q8_q8_matmul_hmma(float *y, const int8_t *xq, const float *xd,
         }
         gpuSyncthreads();
 
+        /* A warp whose tokens are all past S (a short chunk, e.g. a chat
+         * turn of a few dozen tokens in this 128-token tile) has only zero
+         * padding to multiply: skip it. Warp-uniform, so no divergence. */
+        if (s0 + wc < S)
         for (int kb = 0; kb < Q8H_KB; kb++) {
             float acc[Q8H_WG][Q8H_WH][8];
             for (int g = 0; g < Q8H_WG; g++)
@@ -1723,6 +1738,400 @@ picolm_q8_q8_matmul_hmma(float *y, const int8_t *xq, const float *xd,
                 if (o < O && s < S) y[(size_t)s * ys + o] = sum[g][h][j];
             }
 }
+
+/* y[s*ys + o] = sum over the splits of part[z][s][o], in split order
+ * (deterministic, unlike atomics). */
+__global__ void
+picolm_splitk_reduce(float *y, const float *part, int splits, int S, int O, int ys) {
+    const size_t n = (size_t)S * O;
+    for (size_t i = gpuBlockIdx_x * (size_t)gpuBlockDim_x + gpuThreadIdx_x; i < n;
+         i += (size_t)gpuGridDim_x * gpuBlockDim_x) {
+        float v = 0.0f;
+        for (int z = 0; z < splits; z++) v += part[(size_t)z * n + i];
+        y[(i / O) * ys + i % O] = v;
+    }
+}
+
+
+/* ---- IQ6_K x Q8_K GEMM on Volta tensor cores (prefill) ----
+ *
+ * Same scheme as picolm_q8_q8_matmul_hmma: an IQ6_K weight is the integer
+ * iq6nl_lut[q] - 128 + mn (|w| <= 128, exact in fp16), a Q8_K activation is
+ * an int8, so the 16-term dot product of one IQ6_K group is exact in the f32
+ * accumulator. It is then scaled like the CPU's vec_dot_iq6_k_q8_k:
+ * sum += dot * (d * scales[g]) * q8_K.d, group by group.
+ *
+ * A stage is one 64-value sub-block (ib64) of a super-block: weights are
+ * decoded through iq6nl_lut_dev into fp16 in shared memory, the matching
+ * Q8_K activations converted to fp16. Tile, warp layout and mma.m8n8k4
+ * fragments as in picolm_q8_q8_matmul_hmma. Max error vs a double CPU
+ * reference ~3e-7 of sum |terms| (make test-q8-gemm-gpu). */
+#define I6H_TO 64
+#define I6H_TS 128
+#define I6H_WG 4
+#define I6H_WH 2
+#define I6H_WR (I6H_TO / (16 * I6H_WG))
+#define I6H_THREADS (32 * I6H_WR * (I6H_TS / (16 * I6H_WH)))   /* 128 */
+#define I6H_LD (64 + 4)   /* halves per staged row: 34 words, no bank conflicts */
+
+__global__ void __launch_bounds__(I6H_THREADS)
+picolm_iq6_k_q8_K_matmul_hmma(float *y, const int8_t *xq, const float *xd,
+                              const void *weights,
+                              int S, int I, int O, int row_bytes, int y_stride) {
+    __shared__ __align__(16) __half w_sh[I6H_TO][I6H_LD];
+    __shared__ __align__(16) __half x_sh[I6H_TS][I6H_LD];
+    __shared__ float ws_sh[I6H_TO][4];   /* d * scales[g] for this stage */
+    __shared__ float xd_sh[I6H_TS];
+    __shared__ uint8_t lut_sh[64];
+
+    int tid = gpuThreadIdx_x, lane = tid & 31, warp = tid >> 5;
+    int o0 = gpuBlockIdx_x * I6H_TO, s0 = gpuBlockIdx_y * I6H_TS;
+    int ys = y_stride > 0 ? y_stride : O;
+    int n_super = I / 256;
+    if (tid < 64) lut_sh[tid] = iq6nl_lut_dev[tid];
+
+    int qp = (lane >> 2) & 3, r = (lane & 3) + 4 * (lane >> 4);
+    int wr = (warp % I6H_WR) * 16 * I6H_WG, wc = (warp / I6H_WR) * 16 * I6H_WH;
+    int arow[I6H_WG], bcol[I6H_WH], drow[I6H_WG][2], dcol[I6H_WH][4];
+    for (int g = 0; g < I6H_WG; g++) {
+        arow[g] = wr + 16 * g + 8 * (qp & 1) + r;
+        for (int u = 0; u < 2; u++)
+            drow[g][u] = wr + 16 * g + 8 * (qp & 1) + (lane & 1) + 2 * u + 4 * (lane >> 4);
+    }
+    for (int h = 0; h < I6H_WH; h++) {
+        bcol[h] = wc + 16 * h + 8 * (qp >> 1) + r;
+        for (int u = 0; u < 4; u++)
+            dcol[h][u] = wc + 16 * h + 8 * (qp >> 1) + (u & 1) + 2 * ((lane >> 1) & 1) + 4 * (u >> 1);
+    }
+
+    float sum[I6H_WG][I6H_WH][8];
+    for (int g = 0; g < I6H_WG; g++)
+        for (int h = 0; h < I6H_WH; h++)
+            for (int j = 0; j < 8; j++) sum[g][h][j] = 0.0f;
+
+    for (int k0 = 0; k0 < I; k0 += 64) {
+        int sb = k0 / 256, ib64 = (k0 / 64) & 3;
+        gpuSyncthreads();   /* lut_sh written / previous stage consumed */
+        /* Weights: one thread per (row, 16-value group). */
+        for (int it = tid; it < I6H_TO * 4; it += I6H_THREADS) {
+            int rr = it >> 2, gg = it & 3, o = o0 + rr;
+            __half *dst = &w_sh[rr][16 * gg];
+            if (o < O) {
+                const uint8_t *b = (const uint8_t *)weights + (size_t)o * row_bytes + (size_t)sb * 212;
+                float d = gpu_fp16_to_fp32((uint16_t)(b[0] | (b[1] << 8)));
+                int mn = ((b[2] | (b[3] << 8)) >> (4 * ib64 + gg)) & 1;
+                ws_sh[rr][gg] = d * (float)(int8_t)b[4 + 4 * ib64 + gg];
+                const uint8_t *qs = b + 20 + 32 * ib64 + 16 * (gg & 1);
+                const uint8_t *qh = b + 148 + 32 * (ib64 >> 1) + 16 * (gg & 1);
+                int shift = 4 * (ib64 & 1) + 2 * (gg >> 1);
+                for (int j = 0; j < 16; j++) {
+                    int lo = gg < 2 ? (qs[j] & 0x0F) : (qs[j] >> 4);
+                    int q = lo | (((qh[j] >> shift) & 3) << 4);
+                    dst[j] = __int2half_rn((int)lut_sh[q] - 128 + mn);
+                }
+            } else {
+                ws_sh[rr][gg] = 0.0f;
+                for (int j = 0; j < 16; j++) dst[j] = __int2half_rn(0);
+            }
+        }
+        /* Activations: one thread per token, 64 int8. */
+        for (int ls = tid; ls < I6H_TS; ls += I6H_THREADS) {
+            int s = s0 + ls;
+            uint32_t q[16];
+            if (s < S) {
+                const int4 *p = (const int4 *)(xq + (size_t)s * I + k0);
+                for (int i = 0; i < 4; i++) ((int4 *)q)[i] = p[i];
+                xd_sh[ls] = xd[(size_t)s * n_super + sb];
+            } else {
+                for (int i = 0; i < 16; i++) q[i] = 0;
+                xd_sh[ls] = 0.0f;
+            }
+            for (int i = 0; i < 16; i++) q8h_cvt4((__half2 *)&x_sh[ls][4 * i], q[i]);
+        }
+        gpuSyncthreads();
+
+        for (int gg = 0; gg < 4; gg++) {
+            float acc[I6H_WG][I6H_WH][8];
+            for (int g = 0; g < I6H_WG; g++)
+                for (int h = 0; h < I6H_WH; h++)
+                    for (int j = 0; j < 8; j++) acc[g][h][j] = 0.0f;
+#pragma unroll
+            for (int k = 16 * gg; k < 16 * gg + 16; k += 4) {
+                uint2 a[I6H_WG], b[I6H_WH];
+                for (int g = 0; g < I6H_WG; g++) a[g] = *(const uint2 *)&w_sh[arow[g]][k];
+                for (int h = 0; h < I6H_WH; h++) b[h] = *(const uint2 *)&x_sh[bcol[h]][k];
+                for (int g = 0; g < I6H_WG; g++)
+                    for (int h = 0; h < I6H_WH; h++) {
+                        float *c = acc[g][h];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIP__)
+                        asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+                            "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
+                            "{%0,%1,%2,%3,%4,%5,%6,%7};"
+                            : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]),
+                              "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7])
+                            : "r"(a[g].x), "r"(a[g].y), "r"(b[h].x), "r"(b[h].y));
+#endif
+                    }
+            }
+            float wsv[I6H_WG][2], xs[I6H_WH][4];
+            for (int g = 0; g < I6H_WG; g++)
+                for (int u = 0; u < 2; u++) wsv[g][u] = ws_sh[drow[g][u]][gg];
+            for (int h = 0; h < I6H_WH; h++)
+                for (int u = 0; u < 4; u++) xs[h][u] = xd_sh[dcol[h][u]];
+            for (int g = 0; g < I6H_WG; g++)
+                for (int h = 0; h < I6H_WH; h++)
+                    for (int j = 0; j < 8; j++)
+                        sum[g][h][j] += acc[g][h][j] * wsv[g][(j >> 1) & 1] * xs[h][(j & 1) | (j >> 2) << 1];
+        }
+    }
+
+    for (int g = 0; g < I6H_WG; g++)
+        for (int h = 0; h < I6H_WH; h++)
+            for (int j = 0; j < 8; j++) {
+                int o = o0 + drow[g][(j >> 1) & 1], s = s0 + dcol[h][(j & 1) | (j >> 2) << 1];
+                if (o < O && s < S) y[(size_t)s * ys + o] = sum[g][h][j];
+            }
+}
+
+/* ---- Q4_K / Q5_K / Q6_K x Q8_K GEMM on Volta tensor cores (prefill) ----
+ *
+ * Same tile, warps and mma.m8n8k4 fragments as picolm_q8_q8_matmul_hmma; a
+ * stage is 64 values of one super-block. A K-quant weight is an integer times
+ * a group scale (minus a group min for Q4_K/Q5_K), the Q8_K activations int8,
+ * and the scaling is arranged so every product stays exact:
+ *
+ *   Q4_K/Q5_K: the weights are staged pre-scaled, q * sc <= 31 * 63 = 1953,
+ *   exact in fp16, so the accumulators carry a whole super-block and are
+ *   scaled once, sum += xd * (d * acc - dmin * sum_j mn[j] * bsum32[j]), the
+ *   min term in integers from the Q8_K block sums.
+ *
+ *   Q6_K: (q - 32) * sc reaches 4096, not exact in fp16, so it keeps a scale
+ *   per 16-value group, acc += sc * dot, but xd and d move out to the
+ *   super-block, sum += xd * d * acc.
+ *
+ * Scaling every 16 values was 35% of the first version's time and byte-wise
+ * weight unpacking 25% (ablation, V100). Max error vs a double reference
+ * ~3e-8 of the sum of |terms| (make test-kq-gemm-gpu). */
+template <int QT>
+__global__ void __launch_bounds__(I6H_THREADS)
+picolm_kq_q8_K_matmul_hmma(float *y, const int8_t *xq, const float *xd, const int16_t *xbs,
+         const void *weights, int S, int I, int O, int row_bytes, int y_stride) {
+    __shared__ __align__(16) __half w_sh[I6H_TO][I6H_LD];
+    __shared__ __align__(16) __half x_sh[I6H_TS][I6H_LD];
+    __shared__ float wd_sh[I6H_TO], wdm_sh[I6H_TO], xd_sh[I6H_TS];
+    __shared__ float ws_sh[QT == 14 ? I6H_TO : 1][4];          /* Q6_K: sc of this stage */
+    __shared__ int   mn_sh[QT == 14 ? 1 : I6H_TO][8];          /* Q4_K/Q5_K: mins */
+    __shared__ int   bs_sh[QT == 14 ? 1 : I6H_TS][8];          /* Q4_K/Q5_K: bsum32 */
+    const int bsz = QT == 14 ? 210 : QT == 13 ? 176 : 144;
+
+    int tid = gpuThreadIdx_x, lane = tid & 31, warp = tid >> 5;
+    int o0 = gpuBlockIdx_x * I6H_TO, s0 = gpuBlockIdx_y * I6H_TS;
+    int ys = y_stride > 0 ? y_stride : O;
+    int n_super = I / 256;
+    /* gridDim.z > 1: split-K over super-blocks, partials at y + z * S * ys
+     * (picolm_splitk_reduce), as in picolm_q8_q8_matmul_hmma. */
+    const int per = (n_super + (int)gpuGridDim_z - 1) / (int)gpuGridDim_z;
+    const int sb_lo = (int)gpuBlockIdx_z * per;
+    const int sb_hi = sb_lo + per < n_super ? sb_lo + per : n_super;
+    y += (size_t)gpuBlockIdx_z * (size_t)S * ys;
+    const int ts_used = S - s0 >= I6H_TS ? I6H_TS : (S - s0 + 31) / 32 * 32;
+
+    int qp = (lane >> 2) & 3, r = (lane & 3) + 4 * (lane >> 4);
+    int wr = (warp % I6H_WR) * 16 * I6H_WG, wc = (warp / I6H_WR) * 16 * I6H_WH;
+    int arow[I6H_WG], bcol[I6H_WH], drow[I6H_WG][2], dcol[I6H_WH][4];
+    for (int g = 0; g < I6H_WG; g++) {
+        arow[g] = wr + 16 * g + 8 * (qp & 1) + r;
+        for (int u = 0; u < 2; u++)
+            drow[g][u] = wr + 16 * g + 8 * (qp & 1) + (lane & 1) + 2 * u + 4 * (lane >> 4);
+    }
+    for (int h = 0; h < I6H_WH; h++) {
+        bcol[h] = wc + 16 * h + 8 * (qp >> 1) + r;
+        for (int u = 0; u < 4; u++)
+            dcol[h][u] = wc + 16 * h + 8 * (qp >> 1) + (u & 1) + 2 * ((lane >> 1) & 1) + 4 * (u >> 1);
+    }
+
+    float sum[I6H_WG][I6H_WH][8], acc[I6H_WG][I6H_WH][8];
+    for (int g = 0; g < I6H_WG; g++)
+        for (int h = 0; h < I6H_WH; h++)
+            for (int j = 0; j < 8; j++) sum[g][h][j] = acc[g][h][j] = 0.0f;
+
+    for (int k0 = 256 * sb_lo; k0 < 256 * sb_hi; k0 += 64) {
+        const int sb = k0 / 256, part = (k0 / 64) & 3;
+        gpuSyncthreads();   /* previous stage consumed */
+        /* Weights: one thread per (row, 16-value group g16 = 4*part + gg). */
+        for (int it = tid; it < I6H_TO * 4; it += I6H_THREADS) {
+            const int rr = it >> 2, gg = it & 3, o = o0 + rr, g16 = 4 * part + gg;
+            __half2 *dst = (__half2 *)&w_sh[rr][16 * gg];
+            if (o >= O) {
+                for (int t = 0; t < 8; t++) dst[t] = __floats2half2_rn(0.0f, 0.0f);
+                if (QT == 14) ws_sh[rr][gg] = 0.0f;
+                if (part == 0 && gg == 0) { wd_sh[rr] = 0.0f; wdm_sh[rr] = 0.0f; }
+                if (QT != 14 && part == 0 && gg == 0) for (int j = 0; j < 8; j++) mn_sh[rr][j] = 0;
+                continue;
+            }
+            const uint8_t *b = (const uint8_t *)weights + (size_t)o * row_bytes + (size_t)sb * bsz;
+            if (QT == 14) {   /* ql[128] qh[64] sc[16] d */
+                const int n = g16 >> 3, q16 = (g16 & 7) * 16, qq = q16 >> 5, l0 = q16 & 31;
+                const uint16_t *ql = (const uint16_t *)(b + 64 * n + ((qq & 1) ? 32 : 0) + l0);
+                const uint16_t *qh = (const uint16_t *)(b + 128 + 32 * n + l0);
+                const int lsh = (qq & 2) ? 4 : 0, hsh = 2 * qq;
+                for (int t = 0; t < 8; t++) {
+                    const uint32_t L = ql[t], H = qh[t];
+                    const int q0 = (int)(((L >> lsh) & 0xF) | (((H >> hsh) & 3) << 4));
+                    const int q1 = (int)(((L >> (8 + lsh)) & 0xF) | (((H >> (8 + hsh)) & 3) << 4));
+                    dst[t] = __halves2half2(__int2half_rn(q0 - 32), __int2half_rn(q1 - 32));
+                }
+                ws_sh[rr][gg] = (float)(int8_t)b[192 + g16];
+                if (part == 0 && gg == 0) wd_sh[rr] = gpu_fp16_to_fp32(*(const uint16_t *)(b + 208));
+            } else {          /* d dmin sc[12] (qh[32]) qs[128] */
+                const int j = g16 >> 1, l0 = (g16 & 1) * 16, c = j >> 1;
+                const uint4 hd = *(const uint4 *)b;
+                int sc, mn;
+                {   /* get_scale_min_k4 on the header words */
+                    const uint32_t w1 = hd.y, w2 = hd.z, w3 = hd.w;
+                    if (j < 4) { sc = (int)((w1 >> (8 * j)) & 63); mn = (int)((w2 >> (8 * j)) & 63); }
+                    else { const int s8 = 8 * (j - 4);
+                           sc = (int)(((w3 >> s8) & 0x0F) | ((((w1 >> s8) >> 6) & 3) << 4));
+                           mn = (int)((((w3 >> s8) >> 4) & 0x0F) | ((((w2 >> s8) >> 6) & 3) << 4)); }
+                }
+                const uint4 qs = *(const uint4 *)(b + (QT == 13 ? 48 : 16) + 32 * c + l0);
+                uint4 qh = make_uint4(0, 0, 0, 0);
+                if (QT == 13) qh = *(const uint4 *)(b + 16 + l0);
+                const uint32_t qw[4] = { qs.x, qs.y, qs.z, qs.w }, hw[4] = { qh.x, qh.y, qh.z, qh.w };
+#pragma unroll
+                for (int t = 0; t < 8; t++) {
+                    const uint32_t W = qw[t >> 1] >> (16 * (t & 1) + 4 * (j & 1));
+                    int q0 = (int)(W & 0xF), q1 = (int)((W >> 8) & 0xF);
+                    if (QT == 13) {
+                        const uint32_t Hb = hw[t >> 1] >> (16 * (t & 1) + j);
+                        q0 |= (int)((Hb & 1) << 4); q1 |= (int)(((Hb >> 8) & 1) << 4);
+                    }
+                    dst[t] = __halves2half2(__int2half_rn(q0 * sc), __int2half_rn(q1 * sc));
+                }
+                if ((g16 & 1) == 0) mn_sh[rr][j] = mn;
+                if (part == 0 && gg == 0) {
+                    wd_sh[rr]  = gpu_fp16_to_fp32((uint16_t)(hd.x & 0xFFFF));
+                    wdm_sh[rr] = gpu_fp16_to_fp32((uint16_t)(hd.x >> 16));
+                }
+            }
+        }
+        /* Activations: one thread per token, 64 int8 (+ scale, bsum32 at part 0). */
+        for (int ls = tid; ls < ts_used; ls += I6H_THREADS) {   /* tokens a working warp reads */
+            const int s = s0 + ls;
+            uint32_t q[16];
+            if (s < S) {
+                const int4 *p = (const int4 *)(xq + (size_t)s * I + k0);
+                for (int i = 0; i < 4; i++) ((int4 *)q)[i] = p[i];
+                if (part == 0) {
+                    xd_sh[ls] = xd[(size_t)s * n_super + sb];
+                    if (QT != 14) {
+                        const int16_t *bp = xbs + ((size_t)s * n_super + sb) * 16;
+                        for (int j = 0; j < 8; j++) bs_sh[ls][j] = (int)bp[2 * j] + (int)bp[2 * j + 1];
+                    }
+                }
+            } else {
+                for (int i = 0; i < 16; i++) q[i] = 0;
+                if (part == 0) {
+                    xd_sh[ls] = 0.0f;
+                    if (QT != 14) for (int j = 0; j < 8; j++) bs_sh[ls][j] = 0;
+                }
+            }
+            for (int i = 0; i < 16; i++) q8h_cvt4((__half2 *)&x_sh[ls][4 * i], q[i]);
+        }
+        gpuSyncthreads();
+
+        if (s0 + wc < S)   /* all-padding warps of a short chunk skip the mma */
+        for (int gg = 0; gg < 4; gg++) {
+            float c16[I6H_WG][I6H_WH][8];
+            for (int g = 0; g < I6H_WG; g++)
+                for (int h = 0; h < I6H_WH; h++)
+                    for (int j = 0; j < 8; j++) c16[g][h][j] = QT == 14 ? 0.0f : acc[g][h][j];
+#pragma unroll
+            for (int k = 16 * gg; k < 16 * gg + 16; k += 4) {
+                uint2 a[I6H_WG], bb[I6H_WH];
+                for (int g = 0; g < I6H_WG; g++) a[g] = *(const uint2 *)&w_sh[arow[g]][k];
+                for (int h = 0; h < I6H_WH; h++) bb[h] = *(const uint2 *)&x_sh[bcol[h]][k];
+                for (int g = 0; g < I6H_WG; g++)
+                    for (int h = 0; h < I6H_WH; h++) {
+                        float *cc = c16[g][h];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIP__)
+                        asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+                            "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
+                            "{%0,%1,%2,%3,%4,%5,%6,%7};"
+                            : "+f"(cc[0]), "+f"(cc[1]), "+f"(cc[2]), "+f"(cc[3]),
+                              "+f"(cc[4]), "+f"(cc[5]), "+f"(cc[6]), "+f"(cc[7])
+                            : "r"(a[g].x), "r"(a[g].y), "r"(bb[h].x), "r"(bb[h].y));
+#endif
+                    }
+            }
+            if (QT == 14) {   /* acc += sc * group dot */
+                float wsv[I6H_WG][2];
+                for (int g = 0; g < I6H_WG; g++)
+                    for (int u = 0; u < 2; u++) wsv[g][u] = ws_sh[drow[g][u]][gg];
+                for (int g = 0; g < I6H_WG; g++)
+                    for (int h = 0; h < I6H_WH; h++)
+                        for (int j = 0; j < 8; j++) acc[g][h][j] += c16[g][h][j] * wsv[g][(j >> 1) & 1];
+            } else {
+                for (int g = 0; g < I6H_WG; g++)
+                    for (int h = 0; h < I6H_WH; h++)
+                        for (int j = 0; j < 8; j++) acc[g][h][j] = c16[g][h][j];
+            }
+        }
+
+        if (part == 3) {   /* end of super-block: scale and reset */
+#pragma unroll
+            for (int g = 0; g < I6H_WG; g++)
+#pragma unroll
+                for (int u = 0; u < 2; u++) {
+                    const int rr = drow[g][u];
+                    const float d = wd_sh[rr], dm = wdm_sh[rr];
+                    int mn[8];
+                    if (QT != 14)
+#pragma unroll
+                        for (int j = 0; j < 8; j++) mn[j] = mn_sh[rr][j];
+#pragma unroll
+                    for (int h = 0; h < I6H_WH; h++)
+#pragma unroll
+                        for (int v = 0; v < 4; v++) {
+                            const int cc = dcol[h][v], jj = (v & 1) | (u << 1) | ((v >> 1) << 2);
+                            float t = d * acc[g][h][jj];
+                            if (QT != 14) {
+                                int m = 0;
+#pragma unroll
+                                for (int j = 0; j < 8; j++) m += mn[j] * bs_sh[cc][j];
+                                t -= dm * (float)m;
+                            }
+                            sum[g][h][jj] += xd_sh[cc] * t;
+                            acc[g][h][jj] = 0.0f;
+                        }
+                }
+        }
+    }
+
+    for (int g = 0; g < I6H_WG; g++)
+        for (int h = 0; h < I6H_WH; h++)
+            for (int j = 0; j < 8; j++) {
+                int o = o0 + drow[g][(j >> 1) & 1], s = s0 + dcol[h][(j & 1) | (j >> 2) << 1];
+                if (o < O && s < S) y[(size_t)s * ys + o] = sum[g][h][j];
+            }
+}
+
+/* qtype 12/13/14 = Q4_K/Q5_K/Q6_K; grid ((O+63)/64, (S+127)/128). */
+int picolm_kq_q8_K_matmul_hmma_launch(int qtype, dim3 grid, gpuStream_t stream, float *y,
+                                      const int8_t *xq, const float *xd, const int16_t *xbs,
+                                      const void *weights, int S, int I, int O,
+                                      int row_bytes, int y_stride) {
+    if (qtype == 12)
+        picolm_kq_q8_K_matmul_hmma<12><<<grid, I6H_THREADS, 0, stream>>>(y, xq, xd, xbs, weights, S, I, O, row_bytes, y_stride);
+    else if (qtype == 13)
+        picolm_kq_q8_K_matmul_hmma<13><<<grid, I6H_THREADS, 0, stream>>>(y, xq, xd, xbs, weights, S, I, O, row_bytes, y_stride);
+    else if (qtype == 14)
+        picolm_kq_q8_K_matmul_hmma<14><<<grid, I6H_THREADS, 0, stream>>>(y, xq, xd, xbs, weights, S, I, O, row_bytes, y_stride);
+    else return 0;
+    return 1;
+}
+
+
 
 /* ---- FP16 tiled matmul kernel ----
  *
