@@ -5417,7 +5417,9 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
         float *keep = (float *)malloc((size_t)dim * sizeof(float));
         if (keep) memcpy(keep, s->x, (size_t)dim * sizeof(float));
         tensor_set_gpu_tensor(NULL, 0);
+        setenv("PICOLM_SSM_PREFILL_CPU", "1", 1); setenv("PICOLM_PREFILL_CPU", "1", 1);
         model_forward_range(m, lchk, 0, 0, c->n_layers, 1, 0);
+        unsetenv("PICOLM_SSM_PREFILL_CPU"); unsetenv("PICOLM_PREFILL_CPU");
         if (keep) { memcpy(s->x, keep, (size_t)dim * sizeof(float)); free(keep); }
         lchk = -2;
     }
@@ -5842,7 +5844,9 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
             picolm_gpu_memcpy(g, pipe_x, (size_t)dim * sizeof(float), -1, gpu_dev);
             memcpy(s->x, lck_in, (size_t)dim * sizeof(float));
             tensor_set_gpu_tensor(NULL, 0);
+            setenv("PICOLM_SSM_PREFILL_CPU", "1", 1); setenv("PICOLM_PREFILL_CPU", "1", 1);
             model_forward_range(m, token, pos, l, l + 1, 0, 0);
+            unsetenv("PICOLM_SSM_PREFILL_CPU"); unsetenv("PICOLM_PREFILL_CPU");
             double md = 0, mr = 0, mdl = 0, mrl = 0;
             for (int i = 0; i < dim; i++) {
                 const double d = fabs((double)g[i] - s->x[i]), r = fabs((double)s->x[i]);
