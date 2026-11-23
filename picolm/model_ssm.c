@@ -5409,9 +5409,18 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
      * input and print the relative difference of the layer output. Debugging
      * aid; the CPU state it leaves behind is not consistent afterwards. */
     static int lchk = -1;
-    if (lchk < 0) lchk = getenv("PICOLM_GPU_LAYER_CHECK") ? 1 : 0;
-    const int lck = lchk == 1 && pos == 0;
+    if (lchk < 0) { const char *e = getenv("PICOLM_GPU_LAYER_CHECK"); lchk = e ? atoi(e) : -2; }
+    /* value = the one-token prompt's id: the CPU first runs it at pos 0 */
+    const int lck = lchk >= 0 && pos == 1;
     float *lck_in = lck ? (float *)malloc((size_t)dim * 2 * sizeof(float)) : NULL;
+    if (lck_in) {
+        float *keep = (float *)malloc((size_t)dim * sizeof(float));
+        if (keep) memcpy(keep, s->x, (size_t)dim * sizeof(float));
+        tensor_set_gpu_tensor(NULL, 0);
+        model_forward_range(m, lchk, 0, 0, c->n_layers, 1, 0);
+        if (keep) { memcpy(s->x, keep, (size_t)dim * sizeof(float)); free(keep); }
+        lchk = -2;
+    }
     for (int l = 0; l < n_gpu_layers; l++) {
         if (l > 0 && (l % batch_flush_interval) == 0) {
             picolm_gpu_batch_end(gpu_dev);
