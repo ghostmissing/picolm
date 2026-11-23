@@ -3,7 +3,8 @@
  * tokens with carried-in conv and recurrent state. Checks outputs, the
  * updated state and the conv state (relative to their max magnitude).
  * Also the decode MLA attention (picolm_gpu_glm5_mla_attn) against a plain
- * softmax over the F16 latent cache, across the chunk-size steps.
+ * softmax over the F16 latent cache, across the chunk-size steps, and the
+ * tensor-core prefill attention (picolm_gpu_glm5_mla_prefill).
  *
  *   make test-glm5-kda-gpu && ./test_glm5_kda_gpu */
 #include "backend_gpu.h"
@@ -154,9 +155,58 @@ static int run_mla(int NH, int n_kv) {
         if (fabs(ref[i]) > mr) mr = fabs(ref[i]);
     }
     const double rel = mr > 0 ? md / mr : md;
-    ok = ok && rel < 1e-4;
+    /* From 4096 keys the decode runs the f16 tensor-core split (see
+     * PICOLM_GLM5_MLA_WMMA_MIN); below it the f32 kernel. */
+    ok = ok && rel < (n_kv >= 4096 ? 5e-3 : 1e-4);
     printf("mla NH=%-3d n_kv=%-6d ctx %.1e  %s\n", NH, n_kv, rel, ok ? "ok" : "FAIL");
     cudaFree(dc); cudaFree(dq); cudaFree(dctx); cudaFree(dp);
+    free(c16); free(cf); free(q); free(ref); free(got); free(sc);
+    return !ok;
+}
+
+/* Prefill rows: token t of the chunk sees cache rows [0, start + t]. */
+static int run_mla_prefill(int NH, int n_tok, int start) {
+    const int KVL = 512, n_kv = start + n_tok;
+    const float scale = 1.0f / sqrtf(256.0f);
+    uint16_t *c16 = (uint16_t *)malloc(sizeof(uint16_t) * (size_t)n_kv * KVL);
+    float *cf = (float *)malloc(sizeof(float) * (size_t)n_kv * KVL);
+    const size_t nq = (size_t)n_tok * NH * KVL;
+    float *q = (float *)malloc(sizeof(float) * nq), *ref = (float *)calloc(nq, sizeof(float));
+    float *got = (float *)malloc(sizeof(float) * nq);
+    double *sc = (double *)malloc(sizeof(double) * n_kv);
+    for (size_t i = 0; i < (size_t)n_kv * KVL; i++) {
+        __half hv = __float2half(frand());
+        c16[i] = __half_as_ushort(hv); cf[i] = __half2float(hv);
+    }
+    for (size_t i = 0; i < nq; i++) q[i] = frand() * 2.0f;
+    for (int t = 0; t < n_tok; t++)
+        for (int h = 0; h < NH; h++) {
+            const float *qh = q + ((size_t)t * NH + h) * KVL;
+            float *rh = ref + ((size_t)t * NH + h) * KVL;
+            const int L = start + t + 1;
+            double mx = -1e300, l = 0;
+            for (int k = 0; k < L; k++) {
+                double d = 0;
+                for (int j = 0; j < KVL; j++) d += (double)cf[(size_t)k * KVL + j] * qh[j];
+                sc[k] = d * scale; if (sc[k] > mx) mx = sc[k];
+            }
+            for (int k = 0; k < L; k++) { sc[k] = exp(sc[k] - mx); l += sc[k]; }
+            for (int k = 0; k < L; k++)
+                for (int j = 0; j < KVL; j++) rh[j] += (float)(sc[k] / l) * cf[(size_t)k * KVL + j];
+        }
+    uint16_t *dc = (uint16_t *)picolm_gpu_alloc_device(sizeof(uint16_t) * (size_t)n_kv * KVL, 0);
+    int ok = dc && picolm_gpu_memcpy(dc, c16, sizeof(uint16_t) * (size_t)n_kv * KVL, 1, 0) &&
+             picolm_gpu_glm5_mla_prefill(0, NH, KVL, n_tok, start, scale, dc, q, got);
+    double md = 0, mr = 0;
+    for (size_t i = 0; ok && i < nq; i++) {
+        double d = fabs((double)got[i] - ref[i]);
+        if (d > md) md = d;
+        if (fabs(ref[i]) > mr) mr = fabs(ref[i]);
+    }
+    const double rel = mr > 0 ? md / mr : md;
+    ok = ok && rel < 5e-3;
+    printf("mla prefill NH=%-3d tokens=%-4d start=%-5d ctx %.1e  %s\n", NH, n_tok, start, rel, ok ? "ok" : "FAIL");
+    cudaFree(dc);
     free(c16); free(cf); free(q); free(ref); free(got); free(sc);
     return !ok;
 }
@@ -172,7 +222,13 @@ int main(void) {
     f |= run_mla(8, 1);
     f |= run_mla(16, 63);
     f |= run_mla(64, 700);
-    f |= run_mla(32, 17000);     /* > 256 chunks of 64: larger chunks */
+    f |= run_mla(32, 4095);
+    f |= run_mla(32, 17000);     /* tensor-core split */
+    f |= run_mla(64, 70001);     /* more 256-key chunks than the f32 kernel's */
+    f |= run_mla_prefill(32, 1, 0);
+    f |= run_mla_prefill(32, 37, 0);
+    f |= run_mla_prefill(64, 64, 1000);
+    f |= run_mla_prefill(32, 16, 6000);
     printf(f ? "FAILED\n" : "all ok\n");
     return f;
 }

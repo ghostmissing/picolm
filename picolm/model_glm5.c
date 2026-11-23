@@ -3716,7 +3716,7 @@ static struct {
     float *h_kv;        /* host [n_mla][KVL] this token's latents */
     int kda_dev;        /* device KDA states equal the host's */
     int host_stale;     /* device KDA states are ahead of the host's */
-    int kv_rows;        /* device latent rows [0, kv_rows) equal the host's */
+    int *kv_rows;       /* [n_mla]: device latent rows [0, kv_rows) equal the host's */
 } g5d;
 
 /* Weight types picolm_gpu_matmul_dev() multiplies (its generic kernel's list). */
@@ -3864,6 +3864,8 @@ static int glm5_gpu_decode_prepare(model_t *m) {
     if (c->glm5_n_mla > 0) {
         g5d.kv16 = (uint16_t *)g5d_alloc(((size_t)c->glm5_n_mla * c->max_seq_len * KVL + 1) / 2, &ok);
         g5d.kv_new = g5d_alloc((size_t)c->glm5_n_mla * KVL, &ok);
+        g5d.kv_rows = (int *)calloc((size_t)c->glm5_n_mla, sizeof(int));
+        if (!g5d.kv_rows) ok = 0;
         g5d.part = g5d_alloc(picolm_gpu_glm5_mla_part_size(NH, c->max_seq_len) / sizeof(float), &ok);
     }
     for (int i = 0; i < 2; i++) g5d.hx[i] = g5d_alloc((size_t)S * D, &ok);
@@ -3917,8 +3919,46 @@ static void glm5_gpu_state_host(model_t *m, int write, int kv_from) {
     }
     if (write) {
         g5d.kda_dev = 0;
-        if (g5d.kv_rows > kv_from) g5d.kv_rows = kv_from;
+        for (int o = 0; o < m->config.glm5_n_mla; o++)
+            if (g5d.kv_rows[o] > kv_from) g5d.kv_rows[o] = kv_from;
     }
+}
+
+/* Device latent rows of MLA ordinal ord up to `upto` (exclusive), copied from
+ * the host's F32 cache as F16. Rows past `upto` are left as they are. */
+static int g5d_kv_upload(model_t *m, int ord, int upto) {
+    const model_config_t *c = &m->config;
+    const run_state_t *s = &m->state;
+    const int KVL = c->glm5_kv_lora;
+    if (g5d.kv_rows[ord] > upto) g5d.kv_rows[ord] = upto;
+    const size_t base = (size_t)ord * c->max_seq_len * KVL;
+    for (int r = g5d.kv_rows[ord]; r < upto; r += 4096) {
+        const int nr = upto - r < 4096 ? upto - r : 4096;
+        const size_t n = (size_t)nr * KVL, off = base + (size_t)r * KVL;
+        for (size_t i = 0; i < n; i++) g5d.h_kv16[i] = fp32_to_fp16(s->glm5.mla_kv[off + i]);
+        if (!picolm_gpu_memcpy(g5d.kv16 + off, g5d.h_kv16, n * sizeof(uint16_t), 1, glm5_gpu_dev)) return 0;
+    }
+    g5d.kv_rows[ord] = upto;
+    return 1;
+}
+
+/* Prefill MLA attention of one layer on the GPU (picolm_gpu_glm5_mla_prefill),
+ * once the context reaches PICOLM_GLM5_GPU_ATTN_MIN (2048) positions; below
+ * that the transfers outweigh the CPU's work. Brings the device latent rows of
+ * this layer up to the end of the chunk first (the chunk's rows are already in
+ * the host cache). 0: the CPU runs it. */
+static int glm5_gpu_mla_prefill(model_t *m, int ord, const float *qabs_b, float *ctx_b,
+                                int n_tokens, int start_pos) {
+    static int min_kv = -1;
+    if (min_kv < 0) { const char *e = getenv("PICOLM_GLM5_GPU_ATTN_MIN"); min_kv = e ? atoi(e) : 2048; }
+    if (glm5_gpu_dev < 0 || min_kv <= 0 || start_pos + n_tokens < min_kv) return 0;
+    if (!glm5_gpu_decode_prepare(m)) return 0;
+    const model_config_t *c = &m->config;
+    const int KVL = c->glm5_kv_lora;
+    if (!g5d_kv_upload(m, ord, start_pos + n_tokens)) return 0;
+    return picolm_gpu_glm5_mla_prefill(glm5_gpu_dev, c->n_heads, KVL, n_tokens, start_pos,
+                                       1.0f / sqrtf((float)c->glm5_mla_head_dim),
+                                       g5d.kv16 + (size_t)ord * c->max_seq_len * KVL, qabs_b, ctx_b);
 }
 
 /* Brings the device state to the host's at position pos. */
@@ -3937,18 +3977,8 @@ static int glm5_gpu_state_device(model_t *m, int pos) {
         }
         g5d.kda_dev = 1;
     }
-    if (g5d.kv_rows > pos) g5d.kv_rows = pos;
-    for (int ord = 0; ord < c->glm5_n_mla && g5d.kv_rows < pos; ord++) {
-        const size_t base = (size_t)ord * c->max_seq_len * KVL;
-        for (int r = g5d.kv_rows; r < pos; r += 4096) {
-            const int nr = pos - r < 4096 ? pos - r : 4096;
-            const size_t n = (size_t)nr * KVL, off = base + (size_t)r * KVL;
-            if (s->glm5.mla_kv16) memcpy(g5d.h_kv16, s->glm5.mla_kv16 + off, n * sizeof(uint16_t));
-            else for (size_t i = 0; i < n; i++) g5d.h_kv16[i] = fp32_to_fp16(s->glm5.mla_kv[off + i]);
-            if (!picolm_gpu_memcpy(g5d.kv16 + off, g5d.h_kv16, n * sizeof(uint16_t), 1, glm5_gpu_dev)) return 0;
-        }
-    }
-    g5d.kv_rows = pos;
+    for (int ord = 0; ord < c->glm5_n_mla; ord++)
+        if (!g5d_kv_upload(m, ord, pos)) return 0;
     return 1;
 }
 
@@ -4124,7 +4154,7 @@ static float *glm5_gpu_forward(model_t *m, int token, int pos) {
                 for (int d = 0; d < KVL; d++) s->glm5.mla_kv16[off + d] = fp32_to_fp16(kvh[d]);
         }
     }
-    g5d.kv_rows = pos + 1;
+    for (int o = 0; o < c->glm5_n_mla; o++) g5d.kv_rows[o] = pos + 1;
     g5d.host_stale = 1;
     if (t_tok) {
         g_gp.ms[GP_GPU] += glm5_prof_now() - t_tok - t_wait;
@@ -5807,6 +5837,9 @@ static float *glm5_prefill(model_t *m, const int *tokens, int n_tokens,
                                 }
                                 if (ctx_b) {
                                     PFP_BEGIN(tMC);
+#ifdef PICOLM_GPU
+                                    if (!glm5_gpu_mla_prefill(m, mla_ord, qabs_b, ctx_b, n_tokens, start_pos))
+#endif
                                     glm5_mla_attn_batch(c, s, mla_ord, qabs_b, ctx_b,
                                                         n_tokens, start_pos);
                                     PFP_END(tMC, pfk, PF_MLA_CORE);

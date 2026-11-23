@@ -3361,6 +3361,149 @@ extern "C" int picolm_gpu_glm5_kv16(int device, const float *kv, uint16_t *row, 
     return gpu_ok(gpuGetLastError(), "glm5 kv16");
 }
 
+/* MLA prefill attention on tensor cores (WMMA m16n16k16, f16 in, f32 acc).
+ *
+ * Block (t, g): 32 query rows = heads [g*32, g*32+32) of prefill token t, all
+ * with the causal bound L = start + t + 1 over the F16 latent cache (K == V,
+ * KVL = 512). Two passes over 32-key tiles: the first finds each row's max
+ * and sum, the second accumulates softmax(S) . V with the O tile held in
+ * fragments (no per-row rescale, which WMMA accumulators cannot do). The
+ * extra QK pass costs 1.5x the flops of one-pass flash attention.
+ * qabs and ctx are [n_tokens][NH][KVL] F32 on the device. */
+#if !defined(__HIP__)
+#include <mma.h>
+#endif
+#define G5P_BM 32
+#define G5P_BN 32
+#define G5P_LD (G5A_KVL + 8)       /* half stride of the Q and K tiles */
+#define G5P_LS (G5P_BN + 4)        /* float stride of the score tiles */
+#define G5P_LP (G5P_BN + 8)        /* half stride of the P tile */
+#define G5P_SMEM ((size_t)2 * G5P_BM * G5P_LD * 2 + (size_t)2 * G5P_BM * G5P_LS * 4 \
+                  + (size_t)G5P_BM * G5P_LP * 2 + (size_t)2 * G5P_BM * 4)
+
+__global__ void __launch_bounds__(256)
+picolm_glm5_mla_prefill_kernel(const uint16_t *cache, const float *qabs, float *ctx,
+                               float *part_ml, int NH, int start, float scale, int kchunk) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIP__)
+    using namespace nvcuda;
+    extern __shared__ __align__(32) unsigned char g5p_sh[];
+    __half *Qs = (__half *)g5p_sh;                         /* [BM][LD] */
+    __half *Ks = Qs + G5P_BM * G5P_LD;                     /* [BN][LD] */
+    float *Sp = (float *)(Ks + G5P_BN * G5P_LD);           /* [2][BM][LS] split-K halves */
+    __half *Ps = (__half *)(Sp + 2 * G5P_BM * G5P_LS);     /* [BM][LP] */
+    float *rm = (float *)(Ps + G5P_BM * G5P_LP), *rl = rm + G5P_BM;
+    /* part_ml == NULL: prefill, block x = token, all keys of its causal range,
+     * normalised ctx. Else decode split over keys: block x = key chunk of
+     * kchunk keys of the single query token (pos = start), unnormalised
+     * partial o to ctx[x][NH][KVL] and (max, sum) to part_ml[x][NH][2]. */
+    const int g = gpuBlockIdx_y, tid = gpuThreadIdx_x;
+    const int w = tid >> 5, lane = tid & 31, KVL = G5A_KVL;
+    const int split = part_ml != NULL;
+    const int t = split ? 0 : gpuBlockIdx_x;
+    const int kb = split ? gpuBlockIdx_x * kchunk : 0;
+    const int L = split ? min(start + 1, kb + kchunk) : start + t + 1;
+    const int ntile = (L - kb + G5P_BN - 1) / G5P_BN;
+    const size_t row0 = (size_t)t * NH + (size_t)g * G5P_BM;
+    const size_t orow0 = split ? (size_t)gpuBlockIdx_x * NH + (size_t)g * G5P_BM : row0;
+    for (int i = tid; i < G5P_BM * KVL; i += 256) {
+        const int r = i / KVL, d = i - r * KVL;
+        Qs[r * G5P_LD + d] = __float2half(qabs[(row0 + r) * KVL + d]);
+    }
+    if (tid < G5P_BM) { rm[tid] = -INFINITY; rl[tid] = 0.f; }
+    const int fr = (w & 3) >> 1, fc = w & 1, kh = w >> 2;  /* QK: S fragment, k half */
+    const int rb = w >> 2, cb0 = (w & 3) * 8;              /* PV: row block, 8 col blocks */
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> o[8];
+    for (int j = 0; j < 8; j++) wmma::fill_fragment(o[j], 0.0f);
+    for (int pass = 0; pass < 2; pass++) {
+        for (int kt = 0; kt < ntile; kt++) {
+            const int k0 = kb + kt * G5P_BN;
+            __syncthreads();   /* previous tile's K/P reads are done */
+            for (int i = tid; i < G5P_BN * (KVL / 8); i += 256) {
+                const int r = i / (KVL / 8), c8 = (i - r * (KVL / 8)) * 8;
+                uint4 v = make_uint4(0, 0, 0, 0);
+                if (k0 + r < L) v = *(const uint4 *)(cache + (size_t)(k0 + r) * KVL + c8);
+                *(uint4 *)(Ks + r * G5P_LD + c8) = v;
+            }
+            __syncthreads();
+            {   /* S = Q K^T, warp (fr, fc) over half of the 512 dims */
+                wmma::fragment<wmma::accumulator, 16, 16, 16, float> sa;
+                wmma::fill_fragment(sa, 0.0f);
+                for (int kk = kh * 16; kk < kh * 16 + 16; kk++) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a;
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b;
+                    wmma::load_matrix_sync(a, Qs + fr * 16 * G5P_LD + kk * 16, G5P_LD);
+                    wmma::load_matrix_sync(b, Ks + fc * 16 * G5P_LD + kk * 16, G5P_LD);
+                    wmma::mma_sync(sa, a, b, sa);
+                }
+                wmma::store_matrix_sync(Sp + kh * G5P_BM * G5P_LS + fr * 16 * G5P_LS + fc * 16,
+                                        sa, G5P_LS, wmma::mem_row_major);
+            }
+            __syncthreads();
+            for (int r = w * 4; r < w * 4 + 4; r++) {   /* warp: 4 rows, lane: key */
+                const int key = k0 + lane;
+                const float sv = key < L ? (Sp[r * G5P_LS + lane] + Sp[G5P_BM * G5P_LS + r * G5P_LS + lane]) * scale
+                                         : -INFINITY;
+                if (pass == 0) {
+                    float mx = sv;
+                    for (int of = 16; of > 0; of >>= 1) mx = fmaxf(mx, gpuShflXorSync(0xFFFFFFFFu, mx, of));
+                    const float m0 = rm[r], l0 = rl[r], mn = fmaxf(m0, mx);
+                    float e = sv == -INFINITY ? 0.f : expf(sv - mn);
+                    for (int of = 16; of > 0; of >>= 1) e += gpuShflXorSync(0xFFFFFFFFu, e, of);
+                    __syncwarp();   /* every lane has read rm/rl before lane 0 updates them */
+                    if (lane == 0) {
+                        rl[r] = (m0 == -INFINITY ? 0.f : l0 * expf(m0 - mn)) + e;
+                        rm[r] = mn;
+                    }
+                } else {
+                    float p = sv == -INFINITY ? 0.f : expf(sv - rm[r]);
+                    if (!split) p /= rl[r];
+                    Ps[r * G5P_LP + lane] = __float2half(p);
+                }
+            }
+            if (pass == 0) continue;
+            __syncthreads();
+            for (int ks = 0; ks < G5P_BN / 16; ks++) {   /* O += P V */
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a;
+                wmma::load_matrix_sync(a, Ps + rb * 16 * G5P_LP + ks * 16, G5P_LP);
+                for (int j = 0; j < 8; j++) {
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> b;
+                    wmma::load_matrix_sync(b, Ks + ks * 16 * G5P_LD + (cb0 + j) * 16, G5P_LD);
+                    wmma::mma_sync(o[j], a, b, o[j]);
+                }
+            }
+        }
+    }
+    for (int j = 0; j < 8; j++)
+        wmma::store_matrix_sync(ctx + (orow0 + rb * 16) * KVL + (cb0 + j) * 16, o[j], KVL, wmma::mem_row_major);
+    if (split && tid < G5P_BM) {
+        part_ml[(orow0 + tid) * 2] = rm[tid];
+        part_ml[(orow0 + tid) * 2 + 1] = rl[tid];
+    }
+#else
+    (void)cache; (void)qabs; (void)ctx; (void)part_ml; (void)NH; (void)start; (void)scale; (void)kchunk;
+#endif
+}
+
+/* Merge of the split decode partials above: per head, rescale each chunk's
+ * (max, sum, o) to the global max and normalise. */
+__global__ void __launch_bounds__(256)
+picolm_glm5_mla_merge2_kernel(const float *ml, const float *po, float *ctx, int NH, int nc) {
+    const int h = gpuBlockIdx_x, tid = gpuThreadIdx_x;
+    float M = -INFINITY;
+    for (int c = 0; c < nc; c++) M = fmaxf(M, ml[((size_t)c * NH + h) * 2]);
+    float Lsum = 0.f, o0 = 0.f, o1 = 0.f;
+    for (int c = 0; c < nc; c++) {
+        const size_t r = (size_t)c * NH + h;
+        const float f = expf(ml[r * 2] - M);
+        Lsum += ml[r * 2 + 1] * f;
+        o0 += po[r * G5A_KVL + tid] * f;
+        o1 += po[r * G5A_KVL + 256 + tid] * f;
+    }
+    const float inv = 1.0f / Lsum;
+    ctx[(size_t)h * G5A_KVL + tid] = o0 * inv;
+    ctx[(size_t)h * G5A_KVL + 256 + tid] = o1 * inv;
+}
+
 /* ctx[NH][KVL] = softmax(scale * cache . qabs[h]) . cache over n_kv rows.
  * part is scratch from picolm_gpu_glm5_mla_part_size(). 0 if the shape is
  * unsupported (KVL != 512 or NH not a multiple of 8). */
@@ -3374,7 +3517,8 @@ static int g5a_chunk(int n_kv, int *nc) {
 
 extern "C" size_t picolm_gpu_glm5_mla_part_size(int NH, int n_kv) {
     int nc; g5a_chunk(n_kv, &nc);
-    return (size_t)nc * NH * (2 + G5A_KVL) * sizeof(float);
+    const int nc2 = (n_kv + 255) / 256;     /* the tensor-core split, 256 keys a chunk */
+    return (size_t)(nc > nc2 ? nc : nc2) * NH * (2 + G5A_KVL) * sizeof(float);
 }
 
 extern "C" int
@@ -3383,6 +3527,30 @@ picolm_gpu_glm5_mla_attn(int device, int NH, int KVL, int n_kv, float scale,
     if (KVL != G5A_KVL || NH % G5A_HG || n_kv < 1) return 0;
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
+#if !defined(__HIP__)
+    /* Long contexts: the tensor-core kernel split over 256-key chunks reads the
+     * cache once per 32 heads instead of once per 8, at f16 q precision
+     * (~3e-4 instead of ~1e-6). Partials fit in the scratch: fewer chunks. */
+    static int wmma_min = -1;
+    if (wmma_min < 0) { const char *e = getenv("PICOLM_GLM5_MLA_WMMA_MIN"); wmma_min = e ? atoi(e) : 4096; }
+    if (wmma_min > 0 && n_kv >= wmma_min && ctx->compute_major >= 7 && NH % G5P_BM == 0) {
+        const int kc = 256, nc2 = (n_kv + kc - 1) / kc;
+        static int attr2[PICOLM_GPU_MAX_DEVICES];
+        const int d2 = device < PICOLM_GPU_MAX_DEVICES ? device : 0;
+        if (!attr2[d2]) {
+            if (!gpu_ok(gpuFuncSetAttribute((const void *)picolm_glm5_mla_prefill_kernel,
+                        gpuFuncAttributeMaxDynamicSharedMemorySize, (int)G5P_SMEM), "glm5 mla split smem")) return 0;
+            attr2[d2] = 1;
+        }
+        float *po = part, *pml = part + (size_t)nc2 * NH * G5A_KVL;
+        dim3 grid2((unsigned)nc2, (unsigned)(NH / G5P_BM));
+        picolm_glm5_mla_prefill_kernel<<<grid2, 256, G5P_SMEM, ctx->stream>>>(cache, qabs, po, pml, NH,
+                                                                             n_kv - 1, scale, kc);
+        if (!gpu_ok(gpuGetLastError(), "glm5 mla split")) return 0;
+        picolm_glm5_mla_merge2_kernel<<<NH, 256, 0, ctx->stream>>>(pml, po, ctx_out, NH, nc2);
+        return gpu_ok(gpuGetLastError(), "glm5 mla merge2");
+    }
+#endif
     int nc; const int T = g5a_chunk(n_kv, &nc);
     const size_t smem = ((size_t)G5A_HG * G5A_KVL + (size_t)G5A_HG * T + 2 * G5A_HG) * sizeof(float);
     static int attr_set[PICOLM_GPU_MAX_DEVICES];
@@ -3398,6 +3566,47 @@ picolm_gpu_glm5_mla_attn(int device, int NH, int KVL, int n_kv, float scale,
     if (!gpu_ok(gpuGetLastError(), "glm5 mla part")) return 0;
     picolm_glm5_mla_merge_kernel<<<NH, 256, 0, ctx->stream>>>(part, ctx_out, NH, nc);
     return gpu_ok(gpuGetLastError(), "glm5 mla merge");
+}
+
+/* ctx[t][h] = softmax over keys [0, start + t] of the F16 latent cache, for
+ * the n_tokens prefill rows of qabs; host arrays in and out, cache on the
+ * device. 0 if unsupported (HIP, pre-Volta, KVL != 512, NH % 32). */
+extern "C" int
+picolm_gpu_glm5_mla_prefill(int device, int NH, int KVL, int n_tokens, int start, float scale,
+                            const uint16_t *cache, const float *qabs, float *ctx_out) {
+#if defined(__HIP__)
+    (void)device; (void)NH; (void)KVL; (void)n_tokens; (void)start; (void)scale;
+    (void)cache; (void)qabs; (void)ctx_out;
+    return 0;
+#else
+    if (KVL != G5A_KVL || NH % G5P_BM || n_tokens < 1) return 0;
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx) || ctx->compute_major < 7) return 0;
+    const size_t n = (size_t)n_tokens * NH * KVL;
+    static float *buf[PICOLM_GPU_MAX_DEVICES]; static size_t cap[PICOLM_GPU_MAX_DEVICES];
+    static int attr_set[PICOLM_GPU_MAX_DEVICES];
+    const int di = device < PICOLM_GPU_MAX_DEVICES ? device : 0;
+    if (cap[di] < 2 * n) {
+        if (buf[di]) gpuFree(buf[di]);
+        buf[di] = NULL; cap[di] = 0;
+        if (!gpu_ok(gpuMalloc((void **)&buf[di], 2 * n * sizeof(float)), "glm5 mla prefill alloc")) return 0;
+        cap[di] = 2 * n;
+    }
+    if (!attr_set[di]) {
+        if (!gpu_ok(gpuFuncSetAttribute((const void *)picolm_glm5_mla_prefill_kernel,
+                    gpuFuncAttributeMaxDynamicSharedMemorySize, (int)G5P_SMEM), "glm5 mla prefill smem")) return 0;
+        attr_set[di] = 1;
+    }
+    float *dq = buf[di], *dc = dq + n;
+    if (!gpu_ok(gpuMemcpyAsync(dq, qabs, n * sizeof(float), gpuMemcpyHostToDevice, ctx->stream), "glm5 mla prefill H2D"))
+        return 0;
+    dim3 grid((unsigned)n_tokens, (unsigned)(NH / G5P_BM));
+    picolm_glm5_mla_prefill_kernel<<<grid, 256, G5P_SMEM, ctx->stream>>>(cache, dq, dc, NULL, NH, start, scale, 0);
+    if (!gpu_ok(gpuGetLastError(), "glm5 mla prefill kernel")) return 0;
+    if (!gpu_ok(gpuMemcpyAsync(ctx_out, dc, n * sizeof(float), gpuMemcpyDeviceToHost, ctx->stream), "glm5 mla prefill D2H"))
+        return 0;
+    return gpu_ok(gpuStreamSynchronize(ctx->stream), "glm5 mla prefill sync");
+#endif
 }
 
 /* One decode step of a KDA layer on device pointers (the prefill tail kernel

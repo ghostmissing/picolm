@@ -659,6 +659,10 @@ int picolm_gpu_glm5_kda_step(int device, int H, int KD, int CK,
                              const float *dt_bias, const float *a, const float *norm_w,
                              float lower_bound, float eps, float *conv_state, float *state, float *out);
 int picolm_gpu_glm5_d2h(int device, void *dst, const void *src, size_t bytes);
+/* GLM-5 MLA prefill attention on tensor cores: ctx[t][h] (host) from qabs[t][h]
+ * (host) over device F16 latent rows [0, start + t]. 0 if unsupported. */
+int picolm_gpu_glm5_mla_prefill(int device, int NH, int KVL, int n_tokens, int start, float scale,
+                                const uint16_t *cache, const float *qabs, float *ctx);
 /* G independent S=1 products on a tensor of G*Og rows (3-D per-head weight):
  * y[g*Og..] = rows [g*Og, (g+1)*Og) @ x[g*I..]. 0 if the type is not a plain
  * copy of the GGUF layout. */
