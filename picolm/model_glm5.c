@@ -3075,7 +3075,8 @@ static void glm5_moe_ffn(const model_t *m, const glm5_layer_weights_t *gw,
  */
 static void glm5_moe_ffn_batch_ref(const model_t *m, const glm5_layer_weights_t *gw,
                                const layer_weights_t *lw, run_state_t *s,
-                               const float *cur_b, float *out_b, int n_tokens, int layer_idx)
+                               const float *cur_b, float *out_b, int n_tokens, int layer_idx,
+                               int shexp)
 {
     const model_config_t *c = &m->config;
     const int D = c->n_embd;
@@ -3107,7 +3108,7 @@ static void glm5_moe_ffn_batch_ref(const model_t *m, const glm5_layer_weights_t 
         /* Fall back to the per-token path rather than producing garbage.
          * glm5_moe_ffn() zeroes `out` itself, so no pre-clearing is needed. */
         for (int t = 0; t < NT; t++)
-            glm5_moe_ffn(m, gw, lw, s, cur_b + (size_t)t*D, out_b + (size_t)t*D, layer_idx);
+            glm5_moe_ffn_ex(m, gw, lw, s, cur_b + (size_t)t*D, out_b + (size_t)t*D, layer_idx, NULL, shexp);
         return;
     }
 
@@ -3226,7 +3227,7 @@ static void glm5_moe_ffn_batch_ref(const model_t *m, const glm5_layer_weights_t 
         }
 
     /* Shared expert, still per token (1/8 the flops, 36 ms/layer total). */
-    if (lw->ffn_gate_shexp) {
+    if (lw->ffn_gate_shexp && shexp) {
         const int SFF = c->n_ff_shexp;
         if (getenv("PICOLM_DBG_HCVEC") && atoi(getenv("PICOLM_DBG_HCVEC")) == layer_idx) {
             for (int q=0;q<D;q++) s->glm5.moe_down[q]=out_b[q];   /* save routed */
@@ -3396,7 +3397,7 @@ static int ep_grow(void **p, size_t *cap, size_t bytes) {
 static int glm5_moe_ffn_batch_ep(const model_t *m, const glm5_layer_weights_t *gw,
                                  const layer_weights_t *lw, run_state_t *s,
                                  const float *cur_b, float *out_b, int NT, int layer_idx,
-                                 int gpu_moe_try)
+                                 int gpu_moe_try, int shexp)
 {
     const model_config_t *c = &m->config;
     const int D = c->n_embd, NE = c->n_expert, AK = c->n_expert_used, FF = c->n_ff_exp;
@@ -3520,7 +3521,7 @@ static int glm5_moe_ffn_batch_ep(const model_t *m, const glm5_layer_weights_t *g
         double ss=0; for (int q=0;q<D;q++) ss+=(double)out_b[q]*out_b[q];
         fprintf(stderr, "[moechk L%d] routed-only rms=%.6f\n", layer_idx, (float)sqrt(ss/D));
     }
-    if (lw->ffn_gate_shexp) {
+    if (lw->ffn_gate_shexp && shexp) {
         const int SFF = c->n_ff_shexp;
         if (glm5_shexp_batch_enabled()) {
             static float *shg, *shu, *shd; static size_t c_shg, c_shu, c_shd;
@@ -3557,7 +3558,8 @@ static int glm5_moe_ffn_batch_ep(const model_t *m, const glm5_layer_weights_t *g
 /* Dispatcher: the expert-parallel path when enabled and applicable, else the reference. */
 static void glm5_moe_ffn_batch(const model_t *m, const glm5_layer_weights_t *gw,
                                const layer_weights_t *lw, run_state_t *s,
-                               const float *cur_b, float *out_b, int n_tokens, int layer_idx)
+                               const float *cur_b, float *out_b, int n_tokens, int layer_idx,
+                               int shexp)
 {
     const int prof = glm5_moe_prof_on();
     if (prof && g_epp_calls == 0) atexit(glm5_moe_prof_print);
@@ -3600,7 +3602,7 @@ static void glm5_moe_ffn_batch(const model_t *m, const glm5_layer_weights_t *gw,
 #endif
     int ep_rc = 0;
     if ((glm5_moe_ep_enabled() || gpu_try) &&
-        (ep_rc = glm5_moe_ffn_batch_ep(m, gw, lw, s, cur_b, out_b, n_tokens, layer_idx, gpu_try))) {
+        (ep_rc = glm5_moe_ffn_batch_ep(m, gw, lw, s, cur_b, out_b, n_tokens, layer_idx, gpu_try, shexp))) {
         MOE_MEASURE_END(ep_rc == 2);
         if (prof) { g_epp_mode = 1; g_epp_calls++; }
         /* Report the batched MoE output so a prefill can be diffed against
@@ -3615,7 +3617,7 @@ static void glm5_moe_ffn_batch(const model_t *m, const glm5_layer_weights_t *gw,
         return;
     }
     const double t0 = prof ? glm5_prof_now() : 0.0;
-    glm5_moe_ffn_batch_ref(m, gw, lw, s, cur_b, out_b, n_tokens, layer_idx);
+    glm5_moe_ffn_batch_ref(m, gw, lw, s, cur_b, out_b, n_tokens, layer_idx, shexp);
     MOE_MEASURE_END(0);
     if (prof) { g_epp_mode = 0; g_epp_calls++; g_epp_ms[EPP_TOTAL] += glm5_prof_now() - t0; }
     if (glm5_stats_wanted()) {
@@ -4043,7 +4045,7 @@ static float *glm5_gpu_forward(model_t *m, int token, int pos) {
         const g5d_layer_t *L = &g5d.L[il];
         const int ord = c->glm5_layer_mla_ord[il];
 
-        G5D(picolm_gpu_glm5_hc_pre(dev, S, D, g5d.hx[xi], g5d.flat, g5d.mm, L->hc_fn[0], L->hc_base[0],
+        G5D(picolm_gpu_glm5_hc_pre(dev, S, D, 1, g5d.hx[xi], g5d.flat, g5d.mm, L->hc_fn[0], L->hc_base[0],
                                    L->hc_scale[0], eps, c->glm5_hc_eps, c->glm5_sinkhorn_iters, g5d.cur, g5d.pc));
         if (hin) {
             G5D(picolm_gpu_glm5_d2h(dev, hin, g5d.hx[xi], (size_t)SD * sizeof(float)));
@@ -4083,14 +4085,14 @@ static float *glm5_gpu_forward(model_t *m, int token, int pos) {
             G5D(picolm_gpu_matmul_dev(L->beta, br, g5d.cur, 1, dev, 0, 0));
             G5D(picolm_gpu_matmul_dev(L->gb, t[3], ga, 1, dev, 0, 0));
             G5D(picolm_gpu_matmul_dev(L->fb, t[4], fa, 1, dev, 0, 0));
-            G5D(picolm_gpu_glm5_kda_step(dev, H, KD, CK, t[0], t[1], t[2], t[3], t[4], br,
+            G5D(picolm_gpu_glm5_kda_step(dev, 1, H, KD, CK, t[0], t[1], t[2], t[3], t[4], br,
                                          L->conv_w[0], L->conv_w[1], L->conv_w[2], L->dt_bias, L->kda_a,
                                          L->kda_norm, c->glm5_kda_lower_bound, eps,
                                          L->conv_state, L->state, t[6]));
             G5D(picolm_gpu_matmul_dev(L->o, g5d.a, t[6], 1, dev, 0, 0));
         }
         if (hin) g5d_chk(ord >= 0 ? "mla" : "kda", il, g5d.a, s->glm5.attn_out, D);
-        G5D(picolm_gpu_glm5_hc_post(dev, S, D, g5d.a, g5d.hx[xi], g5d.pc, g5d.hx[xi ^ 1]));
+        G5D(picolm_gpu_glm5_hc_post(dev, S, D, 1, g5d.a, g5d.hx[xi], g5d.pc, g5d.hx[xi ^ 1]));
         if (hin) {
             float *ga = g5d_chk_buf((size_t)D * 2) + D;
             G5D(picolm_gpu_glm5_d2h(dev, ga, g5d.a, (size_t)D * sizeof(float)));
@@ -4102,7 +4104,7 @@ static float *glm5_gpu_forward(model_t *m, int token, int pos) {
         }
         xi ^= 1;
 
-        G5D(picolm_gpu_glm5_hc_pre(dev, S, D, g5d.hx[xi], g5d.flat, g5d.mm, L->hc_fn[1], L->hc_base[1],
+        G5D(picolm_gpu_glm5_hc_pre(dev, S, D, 1, g5d.hx[xi], g5d.flat, g5d.mm, L->hc_fn[1], L->hc_base[1],
                                    L->hc_scale[1], eps, c->glm5_hc_eps, c->glm5_sinkhorn_iters, g5d.cur, g5d.pc));
         G5D(picolm_gpu_rmsnorm_dev(g5d.cur, g5d.cur, L->ffn_norm, D, eps, dev));
         if (hin) {
@@ -4135,7 +4137,7 @@ static float *glm5_gpu_forward(model_t *m, int token, int pos) {
             G5D(picolm_gpu_glm5_add(dev, g5d.a, g5d.ffn, D));
         }
         if (hin) g5d_chk(il < c->n_layer_dense_lead ? "dense" : "moe", il, g5d.a, s->glm5.attn_out, D);
-        G5D(picolm_gpu_glm5_hc_post(dev, S, D, g5d.a, g5d.hx[xi], g5d.pc, g5d.hx[xi ^ 1]));
+        G5D(picolm_gpu_glm5_hc_post(dev, S, D, 1, g5d.a, g5d.hx[xi], g5d.pc, g5d.hx[xi ^ 1]));
         xi ^= 1;
     }
     free(hin);
@@ -4174,6 +4176,189 @@ fail:
     return NULL;
 }
 #undef G5D
+
+/* Prefill of one chunk with the activations on the device: the decode step
+ * above for N tokens at once (GEMMs instead of GEMVs, the KDA tail kernel over
+ * the chunk, tensor-core MLA attention). Only the MoE goes through the host:
+ * the normed input comes down and glm5_moe_ffn_batch() routes it and streams
+ * the experts, as in the CPU prefill. The per-op hybrid copied every
+ * projection's activations both ways instead. PICOLM_GLM5_GPU_PREFILL=0
+ * keeps the old path; PICOLM_GLM5_GPU_PFPROF=1 prints a line per chunk. */
+static struct {
+    int cap;
+    float *hx[2], *flat, *mm, *pc, *cur, *a, *t[7];
+    float *h_x, *h_cur, *h_out, *h_kv;   /* host [cap][S*D], [cap][D] x2, [cap][KVL] */
+} g5p;
+
+static int g5p_alloc(model_t *m, int N) {
+    if (N <= g5p.cap) return 1;
+    if (g5p.cap) return 0;   /* sized once for the largest chunk */
+    const model_config_t *c = &m->config;
+    const int D = c->n_embd, S = c->glm5_hc, M = (2 + S) * S, NH = c->n_heads;
+    int cap = glm5_prefill_max_tokens();
+    if (cap < N) cap = N;
+    size_t X = (size_t)c->glm5_n_kda_heads * c->glm5_kda_dim;
+    if ((size_t)NH * c->glm5_kv_lora > X) X = (size_t)NH * c->glm5_kv_lora;
+    if ((size_t)NH * c->glm5_mla_head_dim > X) X = (size_t)NH * c->glm5_mla_head_dim;
+    if ((size_t)c->n_ffn > X) X = (size_t)c->n_ffn;
+    if ((size_t)c->n_ff_shexp > X) X = (size_t)c->n_ff_shexp;
+    if ((size_t)c->glm5_q_lora > X) X = (size_t)c->glm5_q_lora;
+    int ok = 1;
+    for (int i = 0; i < 2; i++) g5p.hx[i] = g5d_alloc((size_t)cap * S * D, &ok);
+    g5p.flat = g5d_alloc((size_t)cap * S * D, &ok);
+    g5p.mm = g5d_alloc((size_t)cap * M, &ok);
+    g5p.pc = g5d_alloc((size_t)cap * (S + S * S), &ok);
+    g5p.cur = g5d_alloc((size_t)cap * D, &ok);
+    g5p.a = g5d_alloc((size_t)cap * D, &ok);
+    for (int i = 0; i < 7; i++) g5p.t[i] = g5d_alloc((size_t)cap * X, &ok);
+    g5p.h_x = (float *)malloc((size_t)cap * S * D * sizeof(float));
+    g5p.h_cur = (float *)malloc((size_t)cap * D * sizeof(float));
+    g5p.h_out = (float *)malloc((size_t)cap * D * sizeof(float));
+    g5p.h_kv = (float *)malloc((size_t)cap * c->glm5_kv_lora * sizeof(float));
+    if (!g5p.h_x || !g5p.h_cur || !g5p.h_out || !g5p.h_kv) ok = 0;
+    if (!ok) {
+        fprintf(stderr, "INFO: GLM-5 prefill stays on the per-op path (no room for a %d-token chunk on the GPU)\n", cap);
+        return 0;
+    }
+    g5p.cap = cap;
+    return 1;
+}
+
+#define G5D(x) do { if (!(x)) { fail_line = __LINE__; goto fail; } } while (0)
+
+static float *glm5_gpu_prefill(model_t *m, const int *tokens, int N, int start) {
+    model_config_t *c = &m->config;
+    model_weights_t *w = &m->weights;
+    run_state_t *s = &m->state;
+    const int dev = glm5_gpu_dev;
+    const int D = c->n_embd, S = c->glm5_hc, NH = c->n_heads, SD = S * D;
+    const int H = c->glm5_n_kda_heads, KD = c->glm5_kda_dim, DI = H * KD, CK = c->ssm_d_conv;
+    const int QL = c->glm5_q_lora, KVL = c->glm5_kv_lora, MHD = c->glm5_mla_head_dim;
+    const float eps = c->rms_norm_eps;
+    const int n_trunk = c->n_layer_kv_from_start > 0 && c->n_layer_kv_from_start <= c->n_layers
+                      ? c->n_layer_kv_from_start : c->n_layers;
+    const int was_stale = g5d.host_stale;
+    const int prof = getenv("PICOLM_GLM5_GPU_PFPROF") != NULL;
+    const double t0 = prof ? glm5_prof_now() : 0.0;
+    double t_moe = 0.0;
+    int fail_line = 0;
+    float **t = g5p.t;
+    G5D(glm5_gpu_state_device(m, start));
+    {
+        const size_t rb = gguf_type_row_size(w->type_token_embd, D);
+        for (int i = 0; i < N; i++) {
+            float *xi = g5p.h_x + (size_t)i * SD;
+            dequantize_row((const uint8_t *)w->token_embd + (size_t)tokens[i] * rb, xi, D, w->type_token_embd);
+            for (int j = 1; j < S; j++) memcpy(xi + (size_t)j * D, xi, (size_t)D * sizeof(float));
+        }
+        G5D(picolm_gpu_memcpy(g5p.hx[0], g5p.h_x, (size_t)N * SD * sizeof(float), 1, dev));
+    }
+    int xi = 0;
+    for (int il = 0; il < n_trunk; il++) {
+        const layer_weights_t *lw = &w->layers[il];
+        const glm5_layer_weights_t *gw = &w->glm5[il];
+        const g5d_layer_t *L = &g5d.L[il];
+        const int ord = c->glm5_layer_mla_ord[il];
+
+        G5D(picolm_gpu_glm5_hc_pre(dev, S, D, N, g5p.hx[xi], g5p.flat, g5p.mm, L->hc_fn[0], L->hc_base[0],
+                                   L->hc_scale[0], eps, c->glm5_hc_eps, c->glm5_sinkhorn_iters, g5p.cur, g5p.pc));
+        G5D(picolm_gpu_rmsnorm_batched_dev(g5p.cur, g5p.cur, L->attn_norm, D, eps, N, 0, dev));
+        if (ord >= 0) {
+            /* t0 = q_a, t1 = q, t2 = qabs, t3 = kv, t4 = ctx, t5 = o_concat */
+            uint16_t *cache = g5d.kv16 + (size_t)ord * c->max_seq_len * KVL;
+            G5D(picolm_gpu_matmul_dev(L->qa, t[0], g5p.cur, N, dev, 0, 0));
+            G5D(picolm_gpu_rmsnorm_batched_dev(t[0], t[0], L->qa_norm, QL, eps, N, 0, dev));
+            G5D(picolm_gpu_matmul_dev(L->qb, t[1], t[0], N, dev, 0, 0));
+            G5D(picolm_gpu_matmul_dev_grouped_s(L->kb, t[2], t[1], NH, N, NH * MHD, NH * KVL, dev));
+            G5D(picolm_gpu_matmul_dev(L->kva, t[3], g5p.cur, N, dev, 0, 0));
+            G5D(picolm_gpu_rmsnorm_batched_dev(t[3], t[3], L->kva_norm, KVL, eps, N, 0, dev));
+            G5D(picolm_gpu_glm5_kv16(dev, t[3], cache + (size_t)start * KVL, N * KVL));
+            G5D(picolm_gpu_glm5_d2h(dev, g5p.h_kv, t[3], (size_t)N * KVL * sizeof(float)));
+            {
+                const size_t off = (size_t)ord * c->max_seq_len * KVL + (size_t)start * KVL;
+                memcpy(s->glm5.mla_kv + off, g5p.h_kv, (size_t)N * KVL * sizeof(float));
+                if (s->glm5.mla_kv16)
+                    for (size_t i = 0; i < (size_t)N * KVL; i++) s->glm5.mla_kv16[off + i] = fp32_to_fp16(g5p.h_kv[i]);
+                g5d.kv_rows[ord] = start + N;
+            }
+            G5D(picolm_gpu_glm5_mla_prefill_dev(dev, NH, KVL, N, start, 1.0f / sqrtf((float)MHD),
+                                                cache, t[2], t[4]));
+            G5D(picolm_gpu_matmul_dev_grouped_s(L->vb, t[5], t[4], NH, N, NH * KVL, NH * MHD, dev));
+            G5D(picolm_gpu_matmul_dev(L->o, g5p.a, t[5], N, dev, 0, 0));
+        } else {
+            /* t0..t4 = q, k, v, z, raw; t5 = [g_a | f_a | beta_raw] planes; t6 = gated heads */
+            float *ga = t[5], *fa = t[5] + (size_t)N * KD, *br = t[5] + (size_t)2 * N * KD;
+            G5D(picolm_gpu_matmul_dev(L->q, t[0], g5p.cur, N, dev, 0, 0));
+            G5D(picolm_gpu_matmul_dev(L->k, t[1], g5p.cur, N, dev, 0, 0));
+            G5D(picolm_gpu_matmul_dev(L->v, t[2], g5p.cur, N, dev, 0, 0));
+            G5D(picolm_gpu_matmul_dev(L->ga, ga, g5p.cur, N, dev, 0, 0));
+            G5D(picolm_gpu_matmul_dev(L->fa, fa, g5p.cur, N, dev, 0, 0));
+            G5D(picolm_gpu_matmul_dev(L->beta, br, g5p.cur, N, dev, 0, 0));
+            G5D(picolm_gpu_matmul_dev(L->gb, t[3], ga, N, dev, 0, 0));
+            G5D(picolm_gpu_matmul_dev(L->fb, t[4], fa, N, dev, 0, 0));
+            G5D(picolm_gpu_glm5_kda_step(dev, N, H, KD, CK, t[0], t[1], t[2], t[3], t[4], br,
+                                         L->conv_w[0], L->conv_w[1], L->conv_w[2], L->dt_bias, L->kda_a,
+                                         L->kda_norm, c->glm5_kda_lower_bound, eps,
+                                         L->conv_state, L->state, t[6]));
+            G5D(picolm_gpu_matmul_dev(L->o, g5p.a, t[6], N, dev, 0, 0));
+        }
+        G5D(picolm_gpu_glm5_hc_post(dev, S, D, N, g5p.a, g5p.hx[xi], g5p.pc, g5p.hx[xi ^ 1]));
+        xi ^= 1;
+
+        G5D(picolm_gpu_glm5_hc_pre(dev, S, D, N, g5p.hx[xi], g5p.flat, g5p.mm, L->hc_fn[1], L->hc_base[1],
+                                   L->hc_scale[1], eps, c->glm5_hc_eps, c->glm5_sinkhorn_iters, g5p.cur, g5p.pc));
+        G5D(picolm_gpu_rmsnorm_batched_dev(g5p.cur, g5p.cur, L->ffn_norm, D, eps, N, 0, dev));
+        if (il < c->n_layer_dense_lead) {
+            G5D(picolm_gpu_matmul_dev(L->gate, t[0], g5p.cur, N, dev, 0, 0));
+            G5D(picolm_gpu_matmul_dev(L->up, t[1], g5p.cur, N, dev, 0, 0));
+            G5D(picolm_gpu_glm5_swiglu(dev, t[0], t[1], N * c->n_ffn, glm5_clamp_value(c)));
+            G5D(picolm_gpu_matmul_dev(L->down, g5p.a, t[0], N, dev, 0, 0));
+        } else {
+            const double tm = prof ? glm5_prof_now() : 0.0;
+            G5D(picolm_gpu_glm5_d2h(dev, g5p.h_cur, g5p.cur, (size_t)N * D * sizeof(float)));
+            if (L->sgate) {   /* queued behind the copy: runs while the host routes */
+                G5D(picolm_gpu_matmul_dev(L->sgate, t[0], g5p.cur, N, dev, 0, 0));
+                G5D(picolm_gpu_matmul_dev(L->sup, t[1], g5p.cur, N, dev, 0, 0));
+                G5D(picolm_gpu_glm5_swiglu(dev, t[0], t[1], N * c->n_ff_shexp, glm5_clamp_value_shexp(c)));
+                G5D(picolm_gpu_matmul_dev(L->sdown, t[2], t[0], N, dev, 0, 0));
+            }
+            glm5_moe_ffn_batch(m, gw, lw, s, g5p.h_cur, g5p.h_out, N, il, !L->sgate);
+            G5D(picolm_gpu_memcpy(g5p.a, g5p.h_out, (size_t)N * D * sizeof(float), 1, dev));
+            if (L->sgate) G5D(picolm_gpu_glm5_add(dev, g5p.a, t[2], N * D));
+            if (prof) t_moe += glm5_prof_now() - tm;
+        }
+        G5D(picolm_gpu_glm5_hc_post(dev, S, D, N, g5p.a, g5p.hx[xi], g5p.pc, g5p.hx[xi ^ 1]));
+        xi ^= 1;
+    }
+    G5D(picolm_gpu_glm5_head_in(dev, S, D, g5p.hx[xi] + (size_t)(N - 1) * SD, g5d.out_norm, eps, g5d.cur));
+    G5D(picolm_gpu_matmul_dev(g5d.head, g5d.logits, g5d.cur, 1, dev, 0, 0));
+    G5D(picolm_gpu_glm5_d2h(dev, s->logits, g5d.logits, (size_t)c->vocab_size * sizeof(float)));
+    g5d.host_stale = 1;
+    if (prof)
+        fprintf(stderr, "[glm5 gpu prefill] %d tokens at %d: %.1f ms (moe %.1f ms)\n",
+                N, start, glm5_prof_now() - t0, t_moe);
+    return s->logits;
+
+fail:
+    if (was_stale || g5d.host_stale) {
+        fprintf(stderr, "FATAL: GLM-5 GPU prefill failed at pos %d (model_glm5.c:%d) after earlier "
+                        "GPU work; the host KDA state is behind\n", start, fail_line);
+        exit(1);
+    }
+    fprintf(stderr, "WARN: GLM-5 GPU prefill failed at pos %d (model_glm5.c:%d); prefill on the CPU\n",
+            start, fail_line);
+    g5d.kda_dev = 0;   /* the device KDA state may be half way through the chunk */
+    return NULL;
+}
+#undef G5D
+
+static int glm5_gpu_prefill_on(model_t *m) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("PICOLM_GLM5_GPU_PREFILL"); on = !(e && atoi(e) == 0); }
+    if (!on || glm5_gpu_dev < 0 || !glm5_gpu_decode_prepare(m)) return 0;
+    if (m->config.glm5_n_mla > 0 && m->config.n_heads % 32) return 0;   /* tensor-core attention */
+    return 1;
+}
 
 /* >0 while model_forward_prefill_glm5 runs: its per-token fallback stays on
  * the CPU next to the batched layers. */
@@ -5512,6 +5697,16 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                                   int start_pos, volatile int *interrupt)
 {
 #ifdef PICOLM_GPU
+    if (n_tokens > 1 && glm5_gpu_prefill_on(m) && g5p_alloc(m, n_tokens < glm5_prefill_max_tokens()
+                                                         ? n_tokens : glm5_prefill_max_tokens())) {
+        float *r = NULL;
+        while (n_tokens > 0) {
+            const int k = n_tokens < g5p.cap ? n_tokens : g5p.cap;
+            if (!(r = glm5_gpu_prefill(m, tokens, k, start_pos))) break;
+            tokens += k; start_pos += k; n_tokens -= k;
+        }
+        if (n_tokens == 0) return r;
+    }
     glm5_gpu_state_host(m, 1, start_pos);
     g5d_prefill_depth++;
     float *r = glm5_prefill(m, tokens, n_tokens, start_pos, interrupt);
@@ -6073,7 +6268,7 @@ static float *glm5_prefill(model_t *m, const int *tokens, int n_tokens,
                 for (int t = 0; t < n_tokens; t++)
                     glm5_dense_ffn(m, lw, s, cur_b + (size_t)t*D, attn_b + (size_t)t*D);
             } else if (n_tokens > 1 && !getenv("PICOLM_GLM5_MOE_PERTOKEN")) {
-                glm5_moe_ffn_batch(m, gw, lw, s, cur_b, attn_b, n_tokens, il);
+                glm5_moe_ffn_batch(m, gw, lw, s, cur_b, attn_b, n_tokens, il, 1);
             } else {
                 for (int t = 0; t < n_tokens; t++)
                     glm5_moe_ffn(m, gw, lw, s, cur_b + (size_t)t*D, attn_b + (size_t)t*D, il);
@@ -6411,6 +6606,25 @@ int glm5_gpu_allow_weights(model_t *m, int device) {
     }
     ALLOW(w->output);
 #undef ALLOW
+    /* Pin the model mapping, so the prefill's expert streaming DMAs straight
+     * from it at full PCIe speed (pageable mmap'd memory gave ~5 GB/s).
+     * Reads the whole file in once; PICOLM_GPU_PIN=0 skips it. */
+    {
+        const char *e = getenv("PICOLM_GPU_PIN");
+        if (!(e && atoi(e) == 0)) {
+            const double t0 = glm5_prof_now();
+            size_t pinned = 0;
+            const int ns = m->n_splits > 0 ? m->n_splits : 1;
+            for (int i = 0; i < ns; i++) {
+                void *pa = m->n_splits > 0 ? m->splits[i].mmap_addr : m->mmap_addr;
+                size_t ps = m->n_splits > 0 ? m->splits[i].mmap_size : m->mmap_size;
+                if (picolm_gpu_pin_host(pa, ps)) pinned += ps;
+            }
+            if (pinned)
+                fprintf(stderr, "INFO: GLM-5: pinned %.1f GB of model mapping for expert streaming (%.1f s)\n",
+                        pinned / 1e9, (glm5_prof_now() - t0) / 1000.0);
+        }
+    }
     return n;
 }
 #endif

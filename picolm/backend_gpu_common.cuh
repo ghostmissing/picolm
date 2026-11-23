@@ -149,6 +149,10 @@ typedef hipEvent_t gpuEvent_t;
 #define gpuGridDim_x hipGridDim_x
 #define gpuGridDim_y hipGridDim_y
 #define gpuHostRegister hipHostRegister
+#define gpuStreamWaitEvent hipStreamWaitEvent
+#define gpuEventCreateWithFlags hipEventCreateWithFlags
+#define gpuEventDisableTiming hipEventDisableTiming
+#define gpuStreamNonBlocking hipStreamNonBlocking
 #define gpuHostUnregister hipHostUnregister
 #define gpuMallocManaged hipMallocManaged
 #define gpuMemset hipMemset
@@ -239,6 +243,10 @@ static inline cudaError_t picolm_cudaMemcpy2D(void *dst, size_t dpitch,
 #define gpuLaunchBlockPerMultiprocessor cudaDevAttrMaxThreadsPerMultiProcessor
 #define gpuDevice cudaDevice
 #define gpuHostRegister cudaHostRegister
+#define gpuStreamWaitEvent cudaStreamWaitEvent
+#define gpuEventCreateWithFlags cudaEventCreateWithFlags
+#define gpuEventDisableTiming cudaEventDisableTiming
+#define gpuStreamNonBlocking cudaStreamNonBlocking
 #define gpuHostUnregister cudaHostUnregister
 #define gpuMallocManaged cudaMallocManaged
 #define gpuMemset cudaMemset

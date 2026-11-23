@@ -2951,6 +2951,25 @@ __global__ void picolm_glm5_swiglu_kernel(float *g, const float *u, size_t n, fl
     }
 }
 
+/* Page-lock a host range (a model file mapping) for direct DMA, read-only.
+ * Returns 1 on success; on failure the range stays pageable. */
+extern "C" int picolm_gpu_pin_host(const void *p, size_t n) {
+    if (!p || !n) return 0;
+    const uintptr_t a = (uintptr_t)p & ~(uintptr_t)4095, b = ((uintptr_t)p + n + 4095) & ~(uintptr_t)4095;
+#ifdef __HIP__
+    const unsigned fl = hipHostRegisterReadOnly;
+#else
+    const unsigned fl = cudaHostRegisterReadOnly;
+#endif
+    if (gpuHostRegister((void *)a, b - a, fl) != gpuSuccess) {
+        fprintf(stderr, "[GPU] could not pin %.1f GB of host memory (%s)\n", (b - a) / 1e9,
+                gpuGetErrorString(gpuGetLastError()));
+        (void)gpuGetLastError();
+        return 0;
+    }
+    return 1;
+}
+
 static int moe_plain_type(int qt) {
     return qt == 0 || qt == 1 || qt == 2 || qt == 8 || qt == 10 || qt == 11 ||
            qt == 12 || qt == 13 || qt == 14;
@@ -2987,10 +3006,17 @@ picolm_gpu_moe_experts(int device, int NE, const int *count, const int *cursor, 
     uint8_t *dg = wbuf[di], *du = dg + (size_t)NE * gate_stride, *dd = du + (size_t)NE * gate_stride;
     float *dxg = abuf[di], *dgu = dxg + (size_t)pairs * D, *dgu2 = dgu + (size_t)pairs * FF,
           *ddwn = dgu2 + (size_t)pairs * FF;
-    if (!gpu_ok(gpuMemcpyAsync(dg, gate_w, (size_t)NE * gate_stride, gpuMemcpyHostToDevice, ctx->stream), "moe H2D gate") ||
-        !gpu_ok(gpuMemcpyAsync(du, up_w, (size_t)NE * gate_stride, gpuMemcpyHostToDevice, ctx->stream), "moe H2D up") ||
-        !gpu_ok(gpuMemcpyAsync(dd, down_w, (size_t)NE * down_stride, gpuMemcpyHostToDevice, ctx->stream), "moe H2D down") ||
-        !gpu_ok(gpuMemcpyAsync(dxg, xg, (size_t)pairs * D * sizeof(float), gpuMemcpyHostToDevice, ctx->stream), "moe H2D x"))
+    /* Weights go up on a second stream, one expert at a time, so expert e's
+     * GEMMs run while e+1 is in flight, and only experts this chunk routes to.
+     * At full PCIe speed when the model mapping is pinned (picolm_gpu_pin_host),
+     * ~5 GB/s from pageable mmap'd memory otherwise. */
+    static gpuStream_t cs[PICOLM_GPU_MAX_DEVICES];
+    static gpuEvent_t cev[PICOLM_GPU_MAX_DEVICES];
+    if (!cs[di] && (!gpu_ok(gpuStreamCreateWithFlags(&cs[di], gpuStreamNonBlocking), "moe copy stream") ||
+                    !gpu_ok(gpuEventCreateWithFlags(&cev[di], gpuEventDisableTiming), "moe copy event"))) {
+        cs[di] = 0; return 0;
+    }
+    if (!gpu_ok(gpuMemcpyAsync(dxg, xg, (size_t)pairs * D * sizeof(float), gpuMemcpyHostToDevice, ctx->stream), "moe H2D x"))
         return 0;
     picolm_gpu_tensor_t tg, tu, td;
     memset(&tg, 0, sizeof tg); tg.qtype = (gguf_type_t)qt_gate; tg.I = D; tg.O = FF; tg.device = device;
@@ -3000,23 +3026,26 @@ picolm_gpu_moe_experts(int device, int NE, const int *count, const int *cursor, 
     td.row_bytes = down_stride / D; td.block_size = gguf_block_size((gguf_type_t)qt_down);
     for (int e = 0; e < NE; e++) {
         if (!count[e]) continue;
-        const size_t pos = (size_t)cursor[e];
+        const size_t pos = (size_t)cursor[e], n = (size_t)count[e];
+        if (!gpu_ok(gpuMemcpyAsync(dg + e * gate_stride, (const uint8_t *)gate_w + e * gate_stride, gate_stride,
+                                   gpuMemcpyHostToDevice, cs[di]), "moe H2D gate") ||
+            !gpu_ok(gpuMemcpyAsync(du + e * gate_stride, (const uint8_t *)up_w + e * gate_stride, gate_stride,
+                                   gpuMemcpyHostToDevice, cs[di]), "moe H2D up") ||
+            !gpu_ok(gpuMemcpyAsync(dd + e * down_stride, (const uint8_t *)down_w + e * down_stride, down_stride,
+                                   gpuMemcpyHostToDevice, cs[di]), "moe H2D down") ||
+            !gpu_ok(gpuEventRecord(cev[di], cs[di]), "moe copy record") ||
+            !gpu_ok(gpuStreamWaitEvent(ctx->stream, cev[di], 0), "moe copy wait"))
+            return 0;
         tg.weights = dg + (size_t)e * gate_stride;
         tu.weights = du + (size_t)e * gate_stride;
-        if (!picolm_gpu_matmul_dev(&tg, dgu + pos * FF, dxg + pos * D, count[e], device, 0, 0) ||
-            !picolm_gpu_matmul_dev(&tu, dgu2 + pos * FF, dxg + pos * D, count[e], device, 0, 0)) return 0;
-    }
-    {
-        const size_t n = (size_t)pairs * FF;
-        unsigned nb = (unsigned)((n + 255) / 256); if (nb > 4096) nb = 4096;
-        picolm_glm5_swiglu_kernel<<<nb, 256, 0, ctx->stream>>>(dgu, dgu2, n, clamp_v);
-        if (!gpu_ok(gpuGetLastError(), "moe swiglu")) return 0;
-    }
-    for (int e = 0; e < NE; e++) {
-        if (!count[e]) continue;
-        const size_t pos = (size_t)cursor[e];
         td.weights = dd + (size_t)e * down_stride;
-        if (!picolm_gpu_matmul_dev(&td, ddwn + pos * D, dgu + pos * FF, count[e], device, 0, 0)) return 0;
+        if (!picolm_gpu_matmul_dev(&tg, dgu + pos * FF, dxg + pos * D, (int)n, device, 0, 0) ||
+            !picolm_gpu_matmul_dev(&tu, dgu2 + pos * FF, dxg + pos * D, (int)n, device, 0, 0)) return 0;
+        const size_t m = n * FF;
+        unsigned nb = (unsigned)((m + 255) / 256); if (nb > 4096) nb = 4096;
+        picolm_glm5_swiglu_kernel<<<nb, 256, 0, ctx->stream>>>(dgu + pos * FF, dgu2 + pos * FF, m, clamp_v);
+        if (!gpu_ok(gpuGetLastError(), "moe swiglu")) return 0;
+        if (!picolm_gpu_matmul_dev(&td, ddwn + pos * D, dgu + pos * FF, (int)n, device, 0, 0)) return 0;
     }
     if (!gpu_ok(gpuStreamSynchronize(ctx->stream), "moe sync")) return 0;
     return gpu_ok(gpuMemcpy(dwn, ddwn, (size_t)pairs * D * sizeof(float), gpuMemcpyDeviceToHost), "moe D2H");
@@ -3027,6 +3056,23 @@ picolm_gpu_moe_experts(int device, int NE, const int *count, const int *cursor, 
  * rows [g*Og, (g+1)*Og) by x[g*I..] into y[g*Og..]. Q8_0 is one quantise and
  * one grouped GEMV launch; other plain-layout types run per group on views.
  * Device pointers, no sync. 0 if the type is not a plain copy. */
+/* S tokens of the same: token rows of x every x_stride floats (group g at
+ * g*I within the row), of y every y_stride (group g at g*Og). */
+extern "C" int
+picolm_gpu_matmul_dev_grouped_s(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev, int G, int S,
+                                int x_stride, int y_stride, int device) {
+    if (!t || G < 1 || S < 1 || t->O % G || !moe_plain_type((int)t->qtype)) return 0;
+    const int I = t->I, Og = t->O / G;
+    picolm_gpu_tensor_t v = *t;
+    v.O = Og;
+    for (int g = 0; g < G; g++) {
+        v.weights = (uint8_t *)t->weights + (size_t)g * Og * t->row_bytes;
+        if (!picolm_gpu_matmul_dev(&v, y_dev + (size_t)g * Og, x_dev + (size_t)g * I, S, device,
+                                   y_stride, x_stride)) return 0;
+    }
+    return 1;
+}
+
 extern "C" int
 picolm_gpu_matmul_dev_grouped(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev, int G, int device) {
     if (!t || G < 1 || t->O % G || !moe_plain_type((int)t->qtype)) return 0;
