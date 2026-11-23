@@ -5418,7 +5418,9 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
         if (keep) memcpy(keep, s->x, (size_t)dim * sizeof(float));
         tensor_set_gpu_tensor(NULL, 0);
         setenv("PICOLM_SSM_PREFILL_CPU", "1", 1); setenv("PICOLM_PREFILL_CPU", "1", 1);
-        model_forward_range(m, lchk, 0, 0, c->n_layers, 1, 0);
+        { const int ka = m->gpu.kv_active; m->gpu.kv_active = 0;
+          model_forward_range(m, lchk, 0, 0, c->n_layers, 1, 0);
+          m->gpu.kv_active = ka; }
         unsetenv("PICOLM_SSM_PREFILL_CPU"); unsetenv("PICOLM_PREFILL_CPU");
         if (keep) { memcpy(s->x, keep, (size_t)dim * sizeof(float)); free(keep); }
         lchk = -2;
@@ -5845,7 +5847,9 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
             memcpy(s->x, lck_in, (size_t)dim * sizeof(float));
             tensor_set_gpu_tensor(NULL, 0);
             setenv("PICOLM_SSM_PREFILL_CPU", "1", 1); setenv("PICOLM_PREFILL_CPU", "1", 1);
-            model_forward_range(m, token, pos, l, l + 1, 0, 0);
+            { const int ka = m->gpu.kv_active; m->gpu.kv_active = 0;
+              model_forward_range(m, token, pos, l, l + 1, 0, 0);
+              m->gpu.kv_active = ka; }
             unsetenv("PICOLM_SSM_PREFILL_CPU"); unsetenv("PICOLM_PREFILL_CPU");
             double md = 0, mr = 0, mdl = 0, mrl = 0;
             for (int i = 0; i < dim; i++) {
