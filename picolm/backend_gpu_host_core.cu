@@ -75,6 +75,22 @@ static int picolm_gpu_no_gemv(void) {
     if (cached < 0) cached = picolm_gpu_env_flag("PICOLM_NO_GEMV");
     return cached;
 }
+
+/* K-quant (and IQ6_K) decode GEMV for this type, 0 if none. These kernels
+ * are plain CUDA (DP4A), no IMMA needed. */
+static int kquant_which(gguf_type_t qt) {
+    switch ((int)qt) {
+    case GGUF_TYPE_Q2_K: return 2;
+    case GGUF_TYPE_Q3_K: return 3;
+    case GGUF_TYPE_Q4_K: return 4;
+    case GGUF_TYPE_Q5_K: return 5;
+    case GGUF_TYPE_Q6_K: return 6;
+    case GGUF_TYPE_IQ6_K: return 141;
+    default: return 0;
+    }
+}
+static int kquant_gemv_dev(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t *t, float *y_dev,
+                           const float *x_dev, int I, int O, int ys, int x_stride, int which, int quantize);
 static int picolm_gpu_no_sm_imma(void) {
     static int cached = -1;
     if (cached < 0) cached = picolm_gpu_env_flag("PICOLM_NO_SM_IMMA");
@@ -1276,6 +1292,18 @@ static int matmul_host_impl(picolm_gpu_tensor_t *t, float *y, const float *x, in
         return 1;
     }
 
+    /* K-quant decode (S == 1) on the GEMVs. They used to be reachable only
+     * through the has_imma branches, so a GPU without IMMA ran K-quant decode
+     * on the per-element dequant matmul. IMMA GPUs keep their IMMA path here. */
+    if (!ctx->has_imma && S == 1 && O >= 8 && I % 256 == 0 && kquant_which(t->qtype) && !picolm_gpu_no_gemv()) {
+        if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
+        if (kquant_gemv_dev(ctx, t, ctx->y, ctx->x, I, O, O, 0, kquant_which(t->qtype), 1)) {
+            if (!gpu_ok(gpuStreamSynchronize(ctx->stream), "kquant gemv sync") ||
+                !gpu_ok(gpuMemcpy(y, ctx->y, yb, gpuMemcpyDeviceToHost), "output download")) return 0;
+            return 1;
+        }
+    }
+
     /* Q6_K x Q8_0 IMMA path: quantize activations to Q8_0, native Q6_K weights. */
     if (t->qtype == GGUF_TYPE_Q6_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
         int n_blocks = I / 32;
@@ -1548,7 +1576,7 @@ picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, int d
 static int
 kquant_gemv_dev(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t *t, float *y_dev,
                 const float *x_dev, int I, int O, int ys, int x_stride,
-                int which /* 5 or 6 */) {
+                int which /* 5 or 6 */, int quantize /* 0: reuse ctx's Q8_K x */) {
     const int n_super = I / 256;
     if (n_super < 1 || I % 256 != 0) return 0;
     if (x_stride > 0 && x_stride != I) return 0;   /* GEMV assumes packed x */
@@ -1580,13 +1608,14 @@ kquant_gemv_dev(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t *t, float *y_dev,
      * this stream and, at one launch per matmul call, it is part of the cost
      * being attributed. This used to pass device 0 unconditionally as well,
      * which times the wrong context on a multi-device setup. */
-    { int _psq = picolm_gpu_prof_slot("quantize_q8");
+    if (quantize) {
+      int _psq = picolm_gpu_prof_slot("quantize_q8");
       picolm_gpu_prof_begin(ctx->device);
       picolm_quantize_q8_K<<<q_grid, 256, 0, ctx->stream>>>(
           ctx->q8_xd, ctx->q8_xq, ctx->q8_k_bsums, x_dev, I, 1);
       picolm_gpu_prof_end(_psq);
+      if (!gpu_ok(gpuGetLastError(), "q8_K quantize (dev)")) return 0;
     }
-    if (!gpu_ok(gpuGetLastError(), "q8_K quantize (dev)")) return 0;
     picolm_gpu_prof_begin(ctx->device);
     if (which == 141) {
         gpu_dispatch_print("matmul_iq6_gemv_dev");
@@ -1603,24 +1632,55 @@ kquant_gemv_dev(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t *t, float *y_dev,
         picolm_q3_K_gemv<<<grid, 32 * GEMV_WARPS, 0, ctx->stream>>>(
             y_dev, ctx->q8_xq, ctx->q8_xd, ctx->q8_k_bsums, t->weights,
             I, O, (int)t->row_bytes, ys);
-    } else if (which == 4) {
-        gpu_dispatch_print("matmul_q4_gemv_dev");
-        picolm_q4_K_gemv<<<grid, 32 * GEMV_WARPS, 0, ctx->stream>>>(
-            y_dev, ctx->q8_xq, ctx->q8_xd, ctx->q8_k_bsums, t->weights,
-            I, O, (int)t->row_bytes, ys);
-    } else if (which == 5) {
-        gpu_dispatch_print("matmul_q5_gemv_dev");
-        picolm_q5_K_gemv<<<grid, 32 * GEMV_WARPS, 0, ctx->stream>>>(
-            y_dev, ctx->q8_xq, ctx->q8_xd, ctx->q8_k_bsums, t->weights,
-            I, O, (int)t->row_bytes, ys);
     } else {
-        gpu_dispatch_print("matmul_q6_gemv_dev");
-        picolm_q6_K_gemv<<<grid, 32 * GEMV_WARPS, 0, ctx->stream>>>(
-            y_dev, ctx->q8_xq, ctx->q8_xd, ctx->q8_k_bsums, t->weights,
-            I, O, (int)t->row_bytes, ys);
+        gpu_dispatch_print(which == 4 ? "matmul_q4_gemv_dev" : which == 5 ? "matmul_q5_gemv_dev" : "matmul_q6_gemv_dev");
+        picolm_kquant_gemv_w_launch(which, ctx->stream, y_dev, ctx->q8_xq, ctx->q8_xd,
+                                    t->weights, I, O, (int)t->row_bytes);
     }
     picolm_gpu_prof_end(_ps);
     return gpu_ok(gpuGetLastError(), "kquant gemv (dev)");
+}
+
+/* n K-quant or n Q8_0 GEMVs (decode, S=1) on the same input: quantise x once.
+ * The separate picolm_gpu_matmul_dev calls quantised it once each -- on
+ * Moistral-11B Q4_K_M that was 7 launches per layer and ~10% of a token. */
+static int
+kquant_gemv_shared(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t **t, float **y, int n,
+                   const float *x_dev, int x_stride) {
+    const int I = t[0]->I;
+    if (picolm_gpu_no_gemv() || (x_stride > 0 && x_stride != I)) return 0;
+    int all_q8 = 1;
+    for (int i = 0; i < n; i++)
+        if (!t[i] || !y[i] || t[i]->I != I || t[i]->qtype != GGUF_TYPE_Q8_0) all_q8 = 0;
+    if (all_q8 && I % 32 == 0 && n <= 3) {   /* Q8_0: one quantise, one GEMV launch */
+        if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, (size_t)I) ||
+            !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, (size_t)(I / 32) * sizeof(float))) return 0;
+        picolm_quantize_q8_0<<<dim3((unsigned)(I / 32), 1), 32, 32 * sizeof(float), ctx->stream>>>(
+            ctx->q8_xq, ctx->q8_xd, x_dev, I, 1);
+        if (!gpu_ok(gpuGetLastError(), "q8 quantize (shared)")) return 0;
+        picolm_gemv_rows_t rows;   /* one launch over all n matrices */
+        int end = 0;
+        for (int i = 0; i < 3; i++) {
+            rows.w[i] = i < n ? t[i]->weights : NULL;
+            rows.y[i] = i < n ? y[i] : NULL;
+            if (i < n) end += t[i]->O;
+            rows.o_end[i] = end;
+        }
+        rows.n = n;
+        int _ps = picolm_gpu_prof_slot("gemv_q8_0");
+        picolm_gpu_prof_begin(ctx->device);
+        picolm_q8_0_gemv_rows<<<dim3((unsigned)end), 32 * GEMV_WARPS, 0, ctx->stream>>>(
+            rows, ctx->q8_xq, ctx->q8_xd, I, (int)t[0]->row_bytes);
+        picolm_gpu_prof_end(_ps);
+        return gpu_ok(gpuGetLastError(), "q8 gemv (shared)");
+    }
+    if (I % 256 != 0) return 0;
+    for (int i = 0; i < n; i++)
+        if (!t[i] || !y[i] || t[i]->I != I || t[i]->O < 8 || !kquant_which(t[i]->qtype)) return 0;
+    for (int i = 0; i < n; i++)
+        if (!kquant_gemv_dev(ctx, t[i], y[i], x_dev, I, t[i]->O, t[i]->O, x_stride,
+                             kquant_which(t[i]->qtype), i == 0)) return 0;
+    return 1;
 }
 
 /* PICOLM_LAUNCH_TMR=1: accumulate the CPU wall time spent inside
@@ -1862,12 +1922,18 @@ matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
          * per-element dequant. (An earlier version returned 0 here, which
          * looked safe but silently disabled IQ6_K for ALL of prefill: the
          * dequant case could never be reached.) */
-        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 141))
+        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 141, 1))
             return 1;
     }
 
+    /* K-quant decode on the GEMVs on any GPU; the has_imma branches below
+     * used to be the only way in (see the host path). */
+    if (S == 1 && O >= 8 && I % 256 == 0 && kquant_which(t->qtype) && !picolm_gpu_no_gemv() &&
+        kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, kquant_which(t->qtype), 1))
+        return 1;
+
     if (t->qtype == GGUF_TYPE_Q2_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
-        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 2))
+        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 2, 1))
             return 1;
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
@@ -1897,7 +1963,7 @@ matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
 
     /* Q3_K x Q8_0 IMMA path (device) */
     if (t->qtype == GGUF_TYPE_Q3_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
-        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 3))
+        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 3, 1))
             return 1;
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
@@ -1929,7 +1995,7 @@ matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
      * Uses picolm_q6_q8_matmul_imma (m16n8k32 tensor cores, 2 IMMA per K-step). */
     if (t->qtype == GGUF_TYPE_Q6_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
         /* Decode fast path: Q6_K GEMV against Q8_K activations. */
-        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 6))
+        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 6, 1))
             return 1;
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
@@ -1978,7 +2044,7 @@ matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     if (t->qtype == GGUF_TYPE_Q5_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
         /* Decode fast path: Q5_K GEMV against Q8_K activations, matching the
          * CPU's activation format for K-quant weights. */
-        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 5))
+        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 5, 1))
             return 1;
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
@@ -2071,7 +2137,7 @@ matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
 
     /* Q4_K x Q8_0 IMMA path (device) -- ENABLED */
     if (t->qtype == GGUF_TYPE_Q4_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
-        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 4))
+        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 4, 1))
             return 1;
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
@@ -2307,16 +2373,27 @@ int picolm_gpu_matmul_logits(picolm_gpu_tensor_t *t, float *logits_dev,
         if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
 
-        gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
-        gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
+        const int gemv = !picolm_gpu_no_gemv();
+        if (!gemv) {   /* only the scalar kernel below reads padding */
+            gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
+            gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
+        }
 
         dim3 q_grid((unsigned)n_blocks, (unsigned)1);
         picolm_quantize_q8_0<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
             ctx->q8_xq, ctx->q8_xd, x_dev, I, 1);
         if (!gpu_ok(gpuGetLastError(), "logits q8 quantize")) return 0;
 
-        /* S=1: can't use IMMA (needs S>=16) or tiled (needs S>=Q8_TILE_S).
-         * Use scalar kernel with O blocks, each computing one logit. */
+        /* S=1: the decode GEMV, as for every other Q8_0 matmul. The scalar
+         * kernel (one block per logit) took 2.7 ms on Cydonia-24B's 131072 x
+         * 5120 lm_head on a V100, the GEMV 0.9 -- ~7% of a token. */
+        if (gemv) {
+            gpu_dispatch_print("matmul_logits_gemv_dev");
+            picolm_q8_0_gemv<<<dim3((unsigned)O), 32 * GEMV_WARPS, 0, ctx->stream>>>(
+                logits_dev, ctx->q8_xq, ctx->q8_xd, t->weights, I, O, (int)t->row_bytes, O);
+            if (gpu_ok(gpuGetLastError(), "logits q8 gemv")) return 1;
+            return 0;
+        }
         gpu_dispatch_print("matmul_logits_dev");
         dim3 grid((unsigned)O, (unsigned)1);
         picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
@@ -2331,8 +2408,8 @@ int picolm_gpu_matmul_logits(picolm_gpu_tensor_t *t, float *logits_dev,
      * straight back to picolm_quant_matmul -- whose switch has no IQ6_K case
      * and therefore ZEROES the logits, poisoning every later token. Reusing
      * kquant_gemv_dev (Q8_K quantise + IQ6_K GEMV) avoids that entirely. */
-    if (t->qtype == GGUF_TYPE_IQ6_K && (I % 256) == 0 && O >= 8) {
-        if (kquant_gemv_dev(ctx, t, logits_dev, x_dev, I, O, O, 0, 141)) return 1;
+    if (kquant_which(t->qtype) && (I % 256) == 0 && O >= 8) {   /* and the other K-quants */
+        if (kquant_gemv_dev(ctx, t, logits_dev, x_dev, I, O, O, 0, kquant_which(t->qtype), 1)) return 1;
         return 0;
     }
     return 0; /* unsupported type */
@@ -2422,9 +2499,16 @@ int picolm_gpu_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk, 
     if (!tq || !tk || !tv || !bq || !bk || !bv || !x_dev || S < 1) return 0;
     if (tq->I < 512 || tk->I < 512 || tv->I < 512) return 0;
     if (tq->I != tk->I || tq->I != tv->I) return 0;
+    if (picolm_gpu_force_f32()) return 0;
+    if (S == 1) {   /* decode: K-quant / Q8_0 GEMVs on one quantize; else the separate calls */
+        gpu_device_ctx_t *ctx = find_ctx(device);
+        if (!select_ctx(ctx)) return 0;
+        picolm_gpu_tensor_t *t[3] = { tq, tk, tv };
+        float *y[3] = { bq, bk, bv };
+        return kquant_gemv_shared(ctx, t, y, 3, x_dev, x_stride);
+    }
     if (tq->qtype != GGUF_TYPE_Q8_0 || tk->qtype != GGUF_TYPE_Q8_0 || tv->qtype != GGUF_TYPE_Q8_0)
         return 0;
-    if (picolm_gpu_force_f32()) return 0;
 
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!select_ctx(ctx)) return 0;
@@ -2583,8 +2667,15 @@ int picolm_gpu_matmul_dev_gu(picolm_gpu_tensor_t *tg, picolm_gpu_tensor_t *tu,
     if (!tg || !tu || !bgate || !bup || !x_dev || S < 1) return 0;
     if (tg->I < 512 || tu->I < 512) return 0;
     if (tg->I != tu->I) return 0;
-    if (tg->qtype != GGUF_TYPE_Q8_0 || tu->qtype != GGUF_TYPE_Q8_0) return 0;
     if (picolm_gpu_force_f32()) return 0;
+    if (S == 1) {   /* decode: K-quant / Q8_0 GEMVs on one quantize; else the separate calls */
+        gpu_device_ctx_t *ctx = find_ctx(device);
+        if (!select_ctx(ctx)) return 0;
+        picolm_gpu_tensor_t *t[2] = { tg, tu };
+        float *y[2] = { bgate, bup };
+        return kquant_gemv_shared(ctx, t, y, 2, x_dev, x_stride);
+    }
+    if (tg->qtype != GGUF_TYPE_Q8_0 || tu->qtype != GGUF_TYPE_Q8_0) return 0;
 
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!select_ctx(ctx)) return 0;

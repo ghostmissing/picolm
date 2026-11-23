@@ -5439,8 +5439,13 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                             l, dmp[0],dmp[1],dmp[2],dmp[3],dmp[4],dmp[5],dmp[6],dmp[7]);
                 }
             } else {
-                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
-                                       pipe_q, pipe_xb, 1, gpu_dev, 0, 0);
+                /* K-quant Q/K/V: one quantize of pipe_xb for all three. */
+                int qkv_shared = picolm_gpu_matmul_dev_qkv((picolm_gpu_tensor_t *)gl->attn_q,
+                    (picolm_gpu_tensor_t *)gl->attn_k, (picolm_gpu_tensor_t *)gl->attn_v,
+                    pipe_q, pipe_k, pipe_v, pipe_xb, 1, gpu_dev, 0, 0, 0);
+                if (!qkv_shared)
+                    picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
+                                           pipe_q, pipe_xb, 1, gpu_dev, 0, 0);
                 if (c->has_ssm) {
                     picolm_gpu_memcpy_async(pipe_attn_out, pipe_q,
                                (size_t)n_heads * 2 * head_dim * sizeof(float), 0, gpu_dev);
@@ -5448,10 +5453,12 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                                                     pipe_gate, n_heads, head_dim,
                                                     gpu_dev);
                 }
-                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k,
-                                       pipe_k, pipe_xb, 1, gpu_dev, 0, 0);
-                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
-                                       pipe_v, pipe_xb, 1, gpu_dev, 0, 0);
+                if (!qkv_shared) {
+                    picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k,
+                                           pipe_k, pipe_xb, 1, gpu_dev, 0, 0);
+                    picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
+                                           pipe_v, pipe_xb, 1, gpu_dev, 0, 0);
+                }
             }
 
             /* E. QK-norm (Qwen3): per-head RMSNorm on Q and K.
@@ -5728,13 +5735,15 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
             }
 
             if (gl->ffn_gate) {
-                /* L. Gate: pipe_gate = ffn_gate @ pipe_ffn_norm */
-                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_gate,
-                                       pipe_gate, pipe_ffn_norm, 1, gpu_dev, 0, 0);
-
-                /* M. Up: pipe_up = ffn_up @ pipe_ffn_norm */
-                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_up,
-                                       pipe_up, pipe_ffn_norm, 1, gpu_dev, 0, 0);
+                /* L+M. Gate and up on pipe_ffn_norm (K-quants: one quantize). */
+                if (!picolm_gpu_matmul_dev_gu((picolm_gpu_tensor_t *)gl->ffn_gate,
+                        (picolm_gpu_tensor_t *)gl->ffn_up, pipe_gate, pipe_up,
+                        pipe_ffn_norm, 1, gpu_dev, 0, 0)) {
+                    picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_gate,
+                                           pipe_gate, pipe_ffn_norm, 1, gpu_dev, 0, 0);
+                    picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_up,
+                                           pipe_up, pipe_ffn_norm, 1, gpu_dev, 0, 0);
+                }
 
                 /* N. SiLU-mul / GELU-mul */
                 if (c->is_gpt2 || c->is_gemma3n) {
