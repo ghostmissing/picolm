@@ -730,6 +730,13 @@ picolm_q8_0_gemv(float *y,
     const int o    = (int)gpuBlockIdx_x;        /* one row per block */
     if (o >= O) return;
     int ys = y_stride > 0 ? y_stride : O;
+    /* gridDim.y > 1: independent products laid out back to back (a 3-D
+     * per-head weight), blockIdx.y picks the weights, input and output. */
+    {
+        const int g = (int)gpuBlockIdx_y;
+        weights = (const uint8_t *)weights + (size_t)g * O * row_bytes;
+        xq += (size_t)g * I; xd += (size_t)g * (I / 32); y += (size_t)g * ys;
+    }
 
     const int n_blocks = I / 32;
     const uint8_t *wrow = (const uint8_t *)weights + (size_t)o * row_bytes;

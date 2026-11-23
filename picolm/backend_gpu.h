@@ -633,6 +633,36 @@ int picolm_gpu_glm5_kda_tail(int device, int N, int H, int KD, int CK,
                              const float *dt_bias, const float *a, const float *norm_w,
                              float lower_bound, float eps,
                              float *conv_state, float *state, float *out);
+/* GLM-5 decode (model_glm5.c glm5_gpu_forward): device pointers, enqueued on
+ * the device stream, no sync unless stated. hc_pre: flat = RMS-normed x[S*D],
+ * mm = fn @ flat, cur = sum_s pre[s] x[s], pc = [post S][Sinkhorn comb S*S].
+ * hc_post: out = a*post + comb^T res. head_in: mean over S, RMSNorm(w).
+ * mla_attn: K == V == the F16 latent cache (KVL 512, NH % 8 == 0), part is
+ * mla_part_size() bytes of scratch. kda_step: one token of the KDA tail with
+ * conv_state/state on the device. d2h waits for the stream. */
+int picolm_gpu_glm5_hc_pre(int device, int S, int D, const float *x, float *flat, float *mm,
+                           picolm_gpu_tensor_t *fn, const float *base, const float *scale,
+                           float eps, float hc_eps, int iters, float *cur, float *pc);
+int picolm_gpu_glm5_hc_post(int device, int S, int D, const float *a, const float *res,
+                            const float *pc, float *out);
+int picolm_gpu_glm5_head_in(int device, int S, int D, const float *x, const float *w, float eps, float *cur);
+int picolm_gpu_glm5_add(int device, float *y, const float *x, int n);
+int picolm_gpu_glm5_swiglu(int device, float *g, const float *u, int n, float clamp_v);
+int picolm_gpu_glm5_kv16(int device, const float *kv, uint16_t *row, int n);
+size_t picolm_gpu_glm5_mla_part_size(int NH, int n_kv);
+int picolm_gpu_glm5_mla_attn(int device, int NH, int KVL, int n_kv, float scale,
+                             const uint16_t *cache, const float *qabs, float *part, float *ctx);
+int picolm_gpu_glm5_kda_step(int device, int H, int KD, int CK,
+                             const float *q, const float *k, const float *v,
+                             const float *z, const float *raw, const float *beta_raw,
+                             const float *wq, const float *wk, const float *wv,
+                             const float *dt_bias, const float *a, const float *norm_w,
+                             float lower_bound, float eps, float *conv_state, float *state, float *out);
+int picolm_gpu_glm5_d2h(int device, void *dst, const void *src, size_t bytes);
+/* G independent S=1 products on a tensor of G*Og rows (3-D per-head weight):
+ * y[g*Og..] = rows [g*Og, (g+1)*Og) @ x[g*I..]. 0 if the type is not a plain
+ * copy of the GGUF layout. */
+int picolm_gpu_matmul_dev_grouped(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev, int G, int device);
 /* GLM-5 routed experts of a prefill chunk on the GPU (expert weights streamed
  * from host RAM per call): rows of xg sorted by expert (cursor/count), out
  * dwn in the same order. 0 if a type is unsupported (caller uses the CPU). */

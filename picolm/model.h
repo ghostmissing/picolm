@@ -1043,6 +1043,10 @@ void picolm_gpu_kv_cache_clear(int device);
  * conv/recurrent states. Returns 0 for non-GLM5 models. */
 /* KDA-only recurrent state (no MLA latents) -- what the generic checkpoint
  * layer uses; see model_recurrent_state_size() above for why. */
+/* GPU decode state hand-over (no-op without it): call before the host reads
+ * the GLM-5 state (write = 0) or after it rewrote it (write = 1; kv_from = the
+ * first latent cache row that changed, or a large value). */
+void model_glm5_gpu_state_sync(model_t *m, int write, int kv_from);
 size_t model_glm5_kda_state_size(const model_t *m);
 size_t model_glm5_kda_state_save(const model_t *m, uint8_t *buf, size_t buf_size);
 size_t model_glm5_kda_state_restore(model_t *m, const uint8_t *buf, size_t buf_size);

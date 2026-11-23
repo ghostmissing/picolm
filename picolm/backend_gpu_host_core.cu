@@ -3021,3 +3021,34 @@ picolm_gpu_moe_experts(int device, int NE, const int *count, const int *cursor, 
     if (!gpu_ok(gpuStreamSynchronize(ctx->stream), "moe sync")) return 0;
     return gpu_ok(gpuMemcpy(dwn, ddwn, (size_t)pairs * D * sizeof(float), gpuMemcpyDeviceToHost), "moe D2H");
 }
+
+/* G independent decode products back to back: t holds G*Og rows of I (a 3-D
+ * per-head weight such as GLM-5's attn_k_b uploaded whole), group g multiplies
+ * rows [g*Og, (g+1)*Og) by x[g*I..] into y[g*Og..]. Q8_0 is one quantise and
+ * one grouped GEMV launch; other plain-layout types run per group on views.
+ * Device pointers, no sync. 0 if the type is not a plain copy. */
+extern "C" int
+picolm_gpu_matmul_dev_grouped(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev, int G, int device) {
+    if (!t || G < 1 || t->O % G || !moe_plain_type((int)t->qtype)) return 0;
+    const int I = t->I, Og = t->O / G;
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (t->qtype == GGUF_TYPE_Q8_0 && I % 32 == 0 && !picolm_gpu_force_f32() && !picolm_gpu_no_gemv()) {
+        const int nb = G * I / 32;
+        if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, (size_t)G * I) ||
+            !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, (size_t)nb * sizeof(float))) return 0;
+        picolm_quantize_q8_0<<<dim3((unsigned)nb, 1), 32, 32 * sizeof(float), ctx->stream>>>(
+            ctx->q8_xq, ctx->q8_xd, x_dev, G * I, 1);
+        if (!gpu_ok(gpuGetLastError(), "grouped q8 quantize")) return 0;
+        picolm_q8_0_gemv<<<dim3((unsigned)Og, (unsigned)G), 32 * GEMV_WARPS, 0, ctx->stream>>>(
+            y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, I, Og, (int)t->row_bytes, Og);
+        return gpu_ok(gpuGetLastError(), "grouped q8 gemv");
+    }
+    picolm_gpu_tensor_t v = *t;
+    v.O = Og;
+    for (int g = 0; g < G; g++) {
+        v.weights = (uint8_t *)t->weights + (size_t)g * Og * t->row_bytes;
+        if (!picolm_gpu_matmul_dev(&v, y_dev + (size_t)g * Og, x_dev + (size_t)g * I, 1, device, 0, 0)) return 0;
+    }
+    return 1;
+}

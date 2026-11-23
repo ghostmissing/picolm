@@ -2,9 +2,13 @@
  * the GPU) against a C copy of glm5_kda_head_task()'s arithmetic, over N
  * tokens with carried-in conv and recurrent state. Checks outputs, the
  * updated state and the conv state (relative to their max magnitude).
+ * Also the decode MLA attention (picolm_gpu_glm5_mla_attn) against a plain
+ * softmax over the F16 latent cache, across the chunk-size steps.
  *
  *   make test-glm5-kda-gpu && ./test_glm5_kda_gpu */
 #include "backend_gpu.h"
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -109,6 +113,54 @@ static int run(int N, int H, int CK) {
     return fail;
 }
 
+/* ctx[h] = softmax(scale * cache . q[h]) . cache, cache rows F16 (K == V). */
+static int run_mla(int NH, int n_kv) {
+    const int KVL = 512;
+    const float scale = 1.0f / sqrtf(256.0f);
+    uint16_t *c16 = (uint16_t *)malloc(sizeof(uint16_t) * (size_t)n_kv * KVL);
+    float *cf = (float *)malloc(sizeof(float) * (size_t)n_kv * KVL);
+    float *q = (float *)malloc(sizeof(float) * NH * KVL), *ref = (float *)calloc((size_t)NH * KVL, sizeof(float));
+    float *got = (float *)malloc(sizeof(float) * NH * KVL), *sc = (float *)malloc(sizeof(float) * n_kv);
+    for (size_t i = 0; i < (size_t)n_kv * KVL; i++) {
+        __half hv = __float2half(frand());
+        c16[i] = __half_as_ushort(hv); cf[i] = __half2float(hv);
+    }
+    for (int i = 0; i < NH * KVL; i++) q[i] = frand() * 2.0f;
+    for (int h = 0; h < NH; h++) {
+        float mx = -1e30f; double l = 0;
+        for (int t = 0; t < n_kv; t++) {
+            double d = 0;
+            for (int j = 0; j < KVL; j++) d += (double)cf[(size_t)t * KVL + j] * q[h * KVL + j];
+            sc[t] = (float)d * scale; if (sc[t] > mx) mx = sc[t];
+        }
+        for (int t = 0; t < n_kv; t++) { sc[t] = expf(sc[t] - mx); l += sc[t]; }
+        for (int t = 0; t < n_kv; t++)
+            for (int j = 0; j < KVL; j++) ref[h * KVL + j] += sc[t] / (float)l * cf[(size_t)t * KVL + j];
+    }
+    const size_t pb = picolm_gpu_glm5_mla_part_size(NH, n_kv);
+    uint16_t *dc = (uint16_t *)picolm_gpu_alloc_device(sizeof(uint16_t) * (size_t)n_kv * KVL, 0);
+    float *dq = (float *)picolm_gpu_alloc_device(sizeof(float) * NH * KVL, 0);
+    float *dctx = (float *)picolm_gpu_alloc_device(sizeof(float) * NH * KVL, 0);
+    float *dp = (float *)picolm_gpu_alloc_device(pb, 0);
+    int ok = dc && dq && dctx && dp &&
+             picolm_gpu_memcpy(dc, c16, sizeof(uint16_t) * (size_t)n_kv * KVL, 1, 0) &&
+             picolm_gpu_memcpy(dq, q, sizeof(float) * NH * KVL, 1, 0) &&
+             picolm_gpu_glm5_mla_attn(0, NH, KVL, n_kv, scale, dc, dq, dp, dctx) &&
+             picolm_gpu_glm5_d2h(0, got, dctx, sizeof(float) * NH * KVL);
+    double md = 0, mr = 0;
+    for (int i = 0; ok && i < NH * KVL; i++) {
+        double d = fabs((double)got[i] - ref[i]);
+        if (d > md) md = d;
+        if (fabs(ref[i]) > mr) mr = fabs(ref[i]);
+    }
+    const double rel = mr > 0 ? md / mr : md;
+    ok = ok && rel < 1e-4;
+    printf("mla NH=%-3d n_kv=%-6d ctx %.1e  %s\n", NH, n_kv, rel, ok ? "ok" : "FAIL");
+    cudaFree(dc); cudaFree(dq); cudaFree(dctx); cudaFree(dp);
+    free(c16); free(cf); free(q); free(ref); free(got); free(sc);
+    return !ok;
+}
+
 int main(void) {
     int dev0 = 0;
     if (!picolm_gpu_init(&dev0, 1)) { printf("no GPU: skipped\n"); return 0; }
@@ -117,6 +169,10 @@ int main(void) {
     f |= run(37, 4, 4);
     f |= run(512, 32, 4);
     f |= run(64, 8, 3);
+    f |= run_mla(8, 1);
+    f |= run_mla(16, 63);
+    f |= run_mla(64, 700);
+    f |= run_mla(32, 17000);     /* > 256 chunks of 64: larger chunks */
     printf(f ? "FAILED\n" : "all ok\n");
     return f;
 }

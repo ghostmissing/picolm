@@ -102,9 +102,10 @@ void tensor_set_gpu_tensor(picolm_gpu_tensor_t *t, int device) {
 
 /* Weight registry (tensor_gpu_allow): open addressing on the weight pointer.
  * t stays NULL until the first eligible matmul_batch() uploads W; a failed
- * upload or matmul marks the entry so it is not retried. */
+ * upload (failed) or batched matmul (no_batch) marks the entry so it is not
+ * retried. tensor_gpu_weight() still hands out a no_batch tensor. */
 #define GPU_REG_SIZE 8192   /* power of two; a 45-layer GLM-5 allows ~1000 */
-typedef struct { const void *w; picolm_gpu_tensor_t *t; int dev, failed; } gpu_reg_t;
+typedef struct { const void *w; picolm_gpu_tensor_t *t; int dev, failed, no_batch, n, d; } gpu_reg_t;
 static gpu_reg_t gpu_reg[GPU_REG_SIZE];
 static int gpu_reg_n = 0;
 
@@ -142,6 +143,22 @@ void tensor_gpu_allow(const void *W, int device) {
     }
     gpu_reg_t *e = gpu_reg_find(W, 1);
     if (e) e->dev = device;
+}
+
+/* Device handle of an allowed weight for n -> d, uploaded on first use (the
+ * same upload matmul_batch uses). NULL if W was not allowed, its upload failed
+ * or it was uploaded with another shape. */
+picolm_gpu_tensor_t *tensor_gpu_weight(const void *W, gguf_type_t qtype, int n, int d) {
+    gpu_reg_t *e = W ? gpu_reg_find(W, 0) : NULL;
+    if (!e || e->failed) return NULL;
+    if (!e->t) {
+        if (!picolm_gpu_tensor_upload((void **)&e->t, W, qtype, n, d, e->dev)) {
+            e->t = NULL; e->failed = 1;
+            return NULL;
+        }
+        e->n = n; e->d = d;
+    }
+    return e->n == n && e->d == d ? e->t : NULL;
 }
 #endif /* PICOLM_GPU */
 
@@ -3576,13 +3593,14 @@ void matmul_batch(float *out, const float *x, int n_batch,
     if (!reg_min) { const char *e = getenv("PICOLM_GPU_BATCH_MIN"); reg_min = e && atoi(e) > 0 ? atoi(e) : 16; }
     if (!gpu_tensor && gpu_reg_n && n_batch >= reg_min && d > 0 && n > 0 && !tl_in_parallel && gpu_is_orchestrator()) {
         gpu_reg_t *e = gpu_reg_find(W, 0);
-        if (e && !e->failed) {
-            if (!e->t && !picolm_gpu_tensor_upload((void **)&e->t, W, qtype, n, d, e->dev)) {
-                e->t = NULL; e->failed = 1;
+        if (e && !e->failed && !e->no_batch) {
+            if (!e->t) {
+                if (picolm_gpu_tensor_upload((void **)&e->t, W, qtype, n, d, e->dev)) { e->n = n; e->d = d; }
+                else { e->t = NULL; e->failed = 1; }
             }
-            if (e->t) {
+            if (e->t && e->n == n && e->d == d) {
                 if (picolm_gpu_matmul(e->t, out, x, n_batch, e->dev)) { DISPATCH("GPU_registry"); return; }
-                e->failed = 1;
+                e->no_batch = 1;
             }
         }
     }

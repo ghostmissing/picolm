@@ -48,6 +48,7 @@ void model_recurrent_state_reset(model_t *m) {
     const model_config_t *c = &m->config;
     if (c->has_ssm) { model_ssm_state_reset(m); return; }
     if (c->is_glm5) {
+        model_glm5_gpu_state_sync(m, 1, 0x7fffffff);
         /* Zero every KDA buffer. Equivalent to restoring a zeroed snapshot,
          * but without allocating one. */
         size_t sz = model_glm5_kda_state_size(m);

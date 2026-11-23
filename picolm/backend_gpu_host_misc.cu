@@ -3086,3 +3086,349 @@ picolm_gpu_glm5_kda_tail(int device, int N, int H, int KD, int CK,
         return 0;
     return gpu_ok(gpuStreamSynchronize(ctx->stream), "glm5 kda tail sync");
 }
+
+/* ================================================================
+ * GLM-5 decode on the GPU (model_glm5.c: glm5_gpu_forward)
+ * ================================================================
+ *
+ * One token per call, everything on device pointers and on the device stream,
+ * no sync: the hyper-connection pre/post mixes, the MLA attention over an F16
+ * latent cache, and the small element-wise steps between the GEMVs. The
+ * projections are picolm_gpu_matmul_dev() and the KDA step is the prefill tail
+ * kernel above with N = 1. Same formulas and order as the CPU decode in
+ * model_glm5.c; not bit-identical (summation order, FMA, expf). */
+
+/* flat = x / sqrt(mean(x^2) + eps) over n values, sum of squares in double
+ * like glm5_hc_pre(). One block. */
+__global__ void __launch_bounds__(1024)
+picolm_glm5_hc_norm_kernel(const float *x, float *flat, int n, float eps) {
+    __shared__ double red[1024];
+    __shared__ float inv_s;
+    double ss = 0.0;
+    for (int i = gpuThreadIdx_x; i < n; i += gpuBlockDim_x) ss += (double)x[i] * (double)x[i];
+    red[gpuThreadIdx_x] = ss;
+    __syncthreads();
+    for (int o = gpuBlockDim_x / 2; o > 0; o >>= 1) {
+        if ((int)gpuThreadIdx_x < o) red[gpuThreadIdx_x] += red[gpuThreadIdx_x + o];
+        __syncthreads();
+    }
+    if (gpuThreadIdx_x == 0) inv_s = 1.0f / (float)sqrt(red[0] / (double)n + (double)eps);
+    __syncthreads();
+    const float inv = inv_s;
+    for (int i = gpuThreadIdx_x; i < n; i += gpuBlockDim_x) flat[i] = x[i] * inv;
+}
+
+/* From the M = (2+S)*S mixes: pre (sigmoid + eps), post (2*sigmoid) and the
+ * Sinkhorn-normalised S x S comb, then cur[d] = sum_s pre[s] * x[s][d].
+ * Every block derives pre itself (S sigmoids); warp 0 of block 0 also runs
+ * the Sinkhorn with one lane per comb element (row and column sums by
+ * shuffles, in the CPU's order) and stores pc = [post S][comb S*S]. */
+#define G5_HC_SMAX 5    /* S*S <= 32 lanes */
+__global__ void picolm_glm5_hc_mix_kernel(const float *mm, const float *base, const float *scale,
+                                          const float *x, float *cur, float *pc,
+                                          int S, int D, float hc_eps, int iters) {
+    __shared__ float pre[G5_HC_SMAX];
+    const int tid = gpuThreadIdx_x;
+    if (tid < S) {
+        const float v = mm[tid] * scale[0] + base[tid];
+        pre[tid] = 1.0f / (1.0f + expf(-v)) + hc_eps;
+    }
+    if (gpuBlockIdx_x == 0 && tid < 32) {
+        const int i = tid, r = i / S, cc = i % S, on = i < S * S;
+        const unsigned F = 0xFFFFFFFFu;
+        if (i < S) {
+            const float v = mm[S + i] * scale[1] + base[S + i];
+            pc[i] = 2.0f * (1.0f / (1.0f + expf(-v)));
+        }
+        float v = on ? mm[2 * S + i] * scale[2] + base[2 * S + i] : 0.0f;
+        float mx = gpuShflSync(F, v, r * S);
+        for (int c = 1; c < S; c++) { const float o = gpuShflSync(F, v, r * S + c); if (o > mx) mx = o; }
+        const float e = expf(v - mx);
+        float sum = 0.f;
+        for (int c = 0; c < S; c++) sum += gpuShflSync(F, e, r * S + c);
+        v = e / sum + hc_eps;
+        sum = hc_eps;
+        for (int q = 0; q < S; q++) sum += gpuShflSync(F, v, q * S + cc);
+        v /= sum;
+        for (int it = 1; it < iters; it++) {
+            sum = hc_eps;
+            for (int c = 0; c < S; c++) sum += gpuShflSync(F, v, r * S + c);
+            v /= sum;
+            sum = hc_eps;
+            for (int q = 0; q < S; q++) sum += gpuShflSync(F, v, q * S + cc);
+            v /= sum;
+        }
+        if (on) pc[S + i] = v;
+    }
+    __syncthreads();
+    const int d = gpuBlockIdx_x * gpuBlockDim_x + tid;
+    if (d >= D) return;
+    float acc = 0.f;
+    for (int s = 0; s < S; s++) acc += pre[s] * x[(size_t)s * D + d];
+    cur[d] = acc;
+}
+
+/* out[i][d] = a[d]*post[i] + sum_j comb[j*S+i] * res[j][d]  (glm5_hc_post) */
+__global__ void picolm_glm5_hc_post_kernel(const float *a, const float *res, const float *pc,
+                                           float *out, int S, int D) {
+    const int idx = gpuBlockIdx_x * gpuBlockDim_x + gpuThreadIdx_x;
+    if (idx >= S * D) return;
+    const int i = idx / D, d = idx - i * D;
+    float o = a[d] * pc[i];
+    for (int j = 0; j < S; j++) o += pc[S + j * S + i] * res[(size_t)j * D + d];
+    out[idx] = o;
+}
+
+/* Final norm input: mean over the S streams, then RMSNorm with w. One block. */
+__global__ void __launch_bounds__(1024)
+picolm_glm5_head_in_kernel(const float *x, const float *w, float *cur, int S, int D, float eps) {
+    __shared__ float red[32];
+    __shared__ float inv_s;
+    const float inv_S = 1.0f / (float)S;
+    float ss = 0.f;
+    for (int d = gpuThreadIdx_x; d < D; d += gpuBlockDim_x) {
+        float acc = 0.f;
+        for (int i = 0; i < S; i++) acc += x[(size_t)i * D + d];
+        acc *= inv_S;
+        cur[d] = acc;
+        ss += acc * acc;
+    }
+    for (int o = 16; o > 0; o >>= 1) ss += gpuShflXorSync(0xFFFFFFFFu, ss, o);
+    if ((gpuThreadIdx_x & 31) == 0) red[gpuThreadIdx_x >> 5] = ss;
+    __syncthreads();
+    if (gpuThreadIdx_x == 0) {
+        float t = 0.f;
+        for (int k = 0; k < (int)(gpuBlockDim_x >> 5); k++) t += red[k];
+        inv_s = 1.0f / sqrtf(t / D + eps);
+    }
+    __syncthreads();
+    for (int d = gpuThreadIdx_x; d < D; d += gpuBlockDim_x) cur[d] *= inv_s * w[d];
+}
+
+__global__ void picolm_glm5_add_kernel(float *y, const float *x, int n) {
+    const int i = gpuBlockIdx_x * gpuBlockDim_x + gpuThreadIdx_x;
+    if (i < n) y[i] += x[i];
+}
+
+/* This token's latent into the F16 cache row. */
+__global__ void picolm_glm5_kv16_kernel(const float *kv, uint16_t *row, int n) {
+    const int i = gpuBlockIdx_x * gpuBlockDim_x + gpuThreadIdx_x;
+    if (i < n) row[i] = gpu_fp32_to_fp16(kv[i]);
+}
+
+/* MLA decode attention, K == V == the F16 latent (KVL = 512), NH query heads.
+ *
+ * Split over the cache: block (c, g) takes keys [c*T, c*T+T) for heads
+ * [g*8, g*8+8), one warp per key for the scores (lane holds 16 of the 512
+ * latent values, kept for all 8 dots), one warp per head for the chunk's
+ * softmax, and one thread per two latent columns for the weighted sum.
+ * Partials (m, l, o) go to part; picolm_glm5_mla_merge_kernel combines them
+ * per head. */
+#define G5A_KVL 512
+#define G5A_HG  8
+#define G5A_TMAX 512
+__global__ void __launch_bounds__(256)
+picolm_glm5_mla_part_kernel(const uint16_t *cache, const float *qabs, float *part,
+                            int NH, int n_kv, int T, float scale) {
+    extern __shared__ float g5a_sh[];
+    float *q = g5a_sh;                       /* [HG][KVL] */
+    float *sc = q + G5A_HG * G5A_KVL;        /* [HG][T]   */
+    float *ml = sc + G5A_HG * T;             /* [HG][2]   */
+    const int c = gpuBlockIdx_x, g = gpuBlockIdx_y, tid = gpuThreadIdx_x;
+    const int lane = tid & 31, w = tid >> 5;
+    const int t0 = c * T, nt = min(T, n_kv - t0);
+    for (int i = tid; i < G5A_HG * G5A_KVL; i += 256)
+        q[i] = qabs[(size_t)g * G5A_HG * G5A_KVL + i];
+    __syncthreads();
+    for (int t = w; t < nt; t += 8) {
+        const uint16_t *row = cache + (size_t)(t0 + t) * G5A_KVL;
+        float kv[16];
+        const uint4 a = *(const uint4 *)(row + lane * 8);
+        const uint4 b = *(const uint4 *)(row + 256 + lane * 8);
+        const uint16_t *ah = (const uint16_t *)&a, *bh = (const uint16_t *)&b;
+        for (int j = 0; j < 8; j++) { kv[j] = gpu_fp16_to_fp32(ah[j]); kv[8 + j] = gpu_fp16_to_fp32(bh[j]); }
+        for (int h = 0; h < G5A_HG; h++) {
+            const float *qh = q + h * G5A_KVL;
+            float s = 0.f;
+            for (int j = 0; j < 8; j++) s += kv[j] * qh[lane * 8 + j];
+            for (int j = 0; j < 8; j++) s += kv[8 + j] * qh[256 + lane * 8 + j];
+            for (int o = 16; o > 0; o >>= 1) s += gpuShflXorSync(0xFFFFFFFFu, s, o);
+            if (lane == 0) sc[h * T + t] = s * scale;
+        }
+    }
+    __syncthreads();
+    {   /* warp w: softmax numerators of head w over this chunk */
+        float *sh = sc + w * T;
+        float mx = -INFINITY;
+        for (int t = lane; t < nt; t += 32) mx = fmaxf(mx, sh[t]);
+        for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, gpuShflXorSync(0xFFFFFFFFu, mx, o));
+        float l = 0.f;
+        for (int t = lane; t < nt; t += 32) { const float p = expf(sh[t] - mx); sh[t] = p; l += p; }
+        for (int o = 16; o > 0; o >>= 1) l += gpuShflXorSync(0xFFFFFFFFu, l, o);
+        if (lane == 0) { ml[w * 2] = mx; ml[w * 2 + 1] = l; }
+    }
+    __syncthreads();
+    float acc[G5A_HG][2];
+    for (int h = 0; h < G5A_HG; h++) acc[h][0] = acc[h][1] = 0.f;
+    for (int t = 0; t < nt; t++) {
+        const uint16_t *row = cache + (size_t)(t0 + t) * G5A_KVL;
+        const float x0 = gpu_fp16_to_fp32(row[tid]), x1 = gpu_fp16_to_fp32(row[256 + tid]);
+        for (int h = 0; h < G5A_HG; h++) {
+            const float p = sc[h * T + t];
+            acc[h][0] += p * x0;
+            acc[h][1] += p * x1;
+        }
+    }
+    const size_t stride = 2 + G5A_KVL;     /* per (chunk, head): m, l, o[KVL] */
+    for (int h = 0; h < G5A_HG; h++) {
+        float *pp = part + ((size_t)c * NH + g * G5A_HG + h) * stride;
+        if (tid == 0) { pp[0] = ml[h * 2]; pp[1] = ml[h * 2 + 1]; }
+        pp[2 + tid] = acc[h][0];
+        pp[2 + 256 + tid] = acc[h][1];
+    }
+}
+
+__global__ void __launch_bounds__(256)
+picolm_glm5_mla_merge_kernel(const float *part, float *ctx, int NH, int nc) {
+    const int h = gpuBlockIdx_x, tid = gpuThreadIdx_x;
+    const size_t stride = 2 + G5A_KVL;
+    float M = -INFINITY;
+    for (int c = 0; c < nc; c++) M = fmaxf(M, part[((size_t)c * NH + h) * stride]);
+    float L = 0.f, o0 = 0.f, o1 = 0.f;
+    for (int c = 0; c < nc; c++) {
+        const float *pp = part + ((size_t)c * NH + h) * stride;
+        const float f = expf(pp[0] - M);
+        L += pp[1] * f;
+        o0 += pp[2 + tid] * f;
+        o1 += pp[2 + 256 + tid] * f;
+    }
+    const float inv = 1.0f / L;
+    ctx[(size_t)h * G5A_KVL + tid] = o0 * inv;
+    ctx[(size_t)h * G5A_KVL + 256 + tid] = o1 * inv;
+}
+
+extern "C" int
+picolm_gpu_glm5_hc_pre(int device, int S, int D, const float *x, float *flat, float *mm,
+                       picolm_gpu_tensor_t *fn, const float *base, const float *scale,
+                       float eps, float hc_eps, int iters, float *cur, float *pc) {
+    if (S < 1 || S > G5_HC_SMAX) return 0;
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    picolm_glm5_hc_norm_kernel<<<1, 1024, 0, ctx->stream>>>(x, flat, S * D, eps);
+    if (!gpu_ok(gpuGetLastError(), "glm5 hc norm")) return 0;
+    if (!picolm_gpu_matmul_dev(fn, mm, flat, 1, device, 0, 0)) return 0;
+    picolm_glm5_hc_mix_kernel<<<(D + 255) / 256, 256, 0, ctx->stream>>>(mm, base, scale, x, cur, pc,
+                                                                       S, D, hc_eps, iters);
+    return gpu_ok(gpuGetLastError(), "glm5 hc mix");
+}
+
+extern "C" int
+picolm_gpu_glm5_hc_post(int device, int S, int D, const float *a, const float *res,
+                        const float *pc, float *out) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    picolm_glm5_hc_post_kernel<<<(S * D + 255) / 256, 256, 0, ctx->stream>>>(a, res, pc, out, S, D);
+    return gpu_ok(gpuGetLastError(), "glm5 hc post");
+}
+
+extern "C" int
+picolm_gpu_glm5_head_in(int device, int S, int D, const float *x, const float *w, float eps, float *cur) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    picolm_glm5_head_in_kernel<<<1, 1024, 0, ctx->stream>>>(x, w, cur, S, D, eps);
+    return gpu_ok(gpuGetLastError(), "glm5 head in");
+}
+
+extern "C" int picolm_gpu_glm5_add(int device, float *y, const float *x, int n) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    picolm_glm5_add_kernel<<<(n + 255) / 256, 256, 0, ctx->stream>>>(y, x, n);
+    return gpu_ok(gpuGetLastError(), "glm5 add");
+}
+
+__global__ void picolm_glm5_swiglu_kernel(float *g, const float *u, size_t n, float clamp_v);
+extern "C" int picolm_gpu_glm5_swiglu(int device, float *g, const float *u, int n, float clamp_v) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    picolm_glm5_swiglu_kernel<<<(n + 255) / 256, 256, 0, ctx->stream>>>(g, u, (size_t)n, clamp_v);
+    return gpu_ok(gpuGetLastError(), "glm5 swiglu");
+}
+
+extern "C" int picolm_gpu_glm5_kv16(int device, const float *kv, uint16_t *row, int n) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    picolm_glm5_kv16_kernel<<<(n + 255) / 256, 256, 0, ctx->stream>>>(kv, row, n);
+    return gpu_ok(gpuGetLastError(), "glm5 kv16");
+}
+
+/* ctx[NH][KVL] = softmax(scale * cache . qabs[h]) . cache over n_kv rows.
+ * part is scratch from picolm_gpu_glm5_mla_part_size(). 0 if the shape is
+ * unsupported (KVL != 512 or NH not a multiple of 8). */
+static int g5a_chunk(int n_kv, int *nc) {
+    int T = 64;
+    if ((n_kv + T - 1) / T > 256) T = ((n_kv + 255) / 256 + 31) & ~31;
+    if (T > G5A_TMAX) T = G5A_TMAX;
+    *nc = (n_kv + T - 1) / T;
+    return T;
+}
+
+extern "C" size_t picolm_gpu_glm5_mla_part_size(int NH, int n_kv) {
+    int nc; g5a_chunk(n_kv, &nc);
+    return (size_t)nc * NH * (2 + G5A_KVL) * sizeof(float);
+}
+
+extern "C" int
+picolm_gpu_glm5_mla_attn(int device, int NH, int KVL, int n_kv, float scale,
+                         const uint16_t *cache, const float *qabs, float *part, float *ctx_out) {
+    if (KVL != G5A_KVL || NH % G5A_HG || n_kv < 1) return 0;
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    int nc; const int T = g5a_chunk(n_kv, &nc);
+    const size_t smem = ((size_t)G5A_HG * G5A_KVL + (size_t)G5A_HG * T + 2 * G5A_HG) * sizeof(float);
+    static int attr_set[PICOLM_GPU_MAX_DEVICES];
+    const int di = device < PICOLM_GPU_MAX_DEVICES ? device : 0;
+    if (!attr_set[di]) {
+        const size_t mx = ((size_t)G5A_HG * G5A_KVL + (size_t)G5A_HG * G5A_TMAX + 2 * G5A_HG) * sizeof(float);
+        if (!gpu_ok(gpuFuncSetAttribute((const void *)picolm_glm5_mla_part_kernel,
+                    gpuFuncAttributeMaxDynamicSharedMemorySize, (int)mx), "glm5 mla smem")) return 0;
+        attr_set[di] = 1;
+    }
+    dim3 grid((unsigned)nc, (unsigned)(NH / G5A_HG));
+    picolm_glm5_mla_part_kernel<<<grid, 256, smem, ctx->stream>>>(cache, qabs, part, NH, n_kv, T, scale);
+    if (!gpu_ok(gpuGetLastError(), "glm5 mla part")) return 0;
+    picolm_glm5_mla_merge_kernel<<<NH, 256, 0, ctx->stream>>>(part, ctx_out, NH, nc);
+    return gpu_ok(gpuGetLastError(), "glm5 mla merge");
+}
+
+/* One decode step of a KDA layer on device pointers (the prefill tail kernel
+ * with N = 1); conv_state and state stay on the device. */
+extern "C" int
+picolm_gpu_glm5_kda_step(int device, int H, int KD, int CK,
+                         const float *q, const float *k, const float *v,
+                         const float *z, const float *raw, const float *beta_raw,
+                         const float *wq, const float *wk, const float *wv,
+                         const float *dt_bias, const float *a, const float *norm_w,
+                         float lower_bound, float eps, float *conv_state, float *state, float *out) {
+    if (KD != G5K_KD || CK < 2 || CK > 4 || H < 1) return 0;
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    const size_t smem = ((size_t)KD * KD + 4 * KD + KD / 32) * sizeof(float);
+    static int attr_set[PICOLM_GPU_MAX_DEVICES];
+    const int di = device < PICOLM_GPU_MAX_DEVICES ? device : 0;
+    if (!attr_set[di]) {
+        if (!gpu_ok(gpuFuncSetAttribute((const void *)picolm_glm5_kda_tail_kernel,
+                    gpuFuncAttributeMaxDynamicSharedMemorySize, (int)smem), "glm5 kda step smem")) return 0;
+        attr_set[di] = 1;
+    }
+    picolm_glm5_kda_tail_kernel<<<H, KD, smem, ctx->stream>>>(q, k, v, z, raw, beta_raw, wq, wk, wv,
+        dt_bias, a, norm_w, conv_state, state, out, 1, H, CK, lower_bound, eps);
+    return gpu_ok(gpuGetLastError(), "glm5 kda step");
+}
+
+/* Device-to-host copy ordered on the device stream, then wait for it. */
+extern "C" int picolm_gpu_glm5_d2h(int device, void *dst, const void *src, size_t bytes) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (!gpu_ok(gpuMemcpyAsync(dst, src, bytes, gpuMemcpyDeviceToHost, ctx->stream), "glm5 D2H")) return 0;
+    return gpu_ok(gpuStreamSynchronize(ctx->stream), "glm5 D2H sync");
+}

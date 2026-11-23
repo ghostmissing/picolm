@@ -23,6 +23,9 @@ void tensor_set_gpu_tensor(picolm_gpu_tensor_t *t, int device);
  * (16) rows on the GPU when W was allowed here, uploading W on first use
  * with that call's n/d/qtype. Call from the orchestrator thread. */
 void tensor_gpu_allow(const void *W, int device);
+/* Device handle of an allowed weight for n -> d (uploaded on first use), or
+ * NULL. For forwards that run on device pointers (GLM-5 decode). */
+picolm_gpu_tensor_t *tensor_gpu_weight(const void *W, gguf_type_t qtype, int n, int d);
 #endif
 
 /* Set number of threads for matmul (default: 1) */
